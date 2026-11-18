@@ -10,6 +10,11 @@ import {
   sendPasswordResetEmail,
   applyActionCode,
   checkActionCode,
+  sendSignInLinkToEmail,
+  isSignInWithEmailLink,
+  signInWithEmailLink,
+  updatePassword,
+  getAdditionalUserInfo,
   signOut,
   deleteUser,
   onAuthStateChanged,
@@ -1084,6 +1089,8 @@ export const registerArtistWithFirebase = async (artistData: {
   artistApplicationSubmitted?: boolean;
   artistApplicationDate?: string;
   createdAt?: any;
+  /** Treat this write as the creation of a brand-new profile (applies defaults + createdAt) even without a password. */
+  isNewRegistration?: boolean;
 }) => {
   const cleanEmail = artistData.email.trim().toLowerCase();
   const sanitizedEmailKey = cleanEmail.replace(/[^a-zA-Z0-9]/g, '_');
@@ -1169,7 +1176,7 @@ export const registerArtistWithFirebase = async (artistData: {
     ? artistData.categories
     : undefined;
 
-  const isCreatingNewAccount = Boolean(artistData.password && artistData.password.trim().length > 0);
+  const isCreatingNewAccount = Boolean(artistData.password && artistData.password.trim().length > 0) || Boolean(artistData.isNewRegistration);
   const resolvedStatus = artistData.status || (artistData.role === 'admin' ? 'approved' : (isCreatingNewAccount ? 'unapplied' : undefined));
 
   // Build non-destructive payload so partial updates (such as submitting an application)
@@ -1993,6 +2000,155 @@ export const markEmailVerifiedInFirestore = async (uid: string | undefined, emai
     writes.push(withTimeout(setDoc(doc(db, 'artists', cleanEmail), payload, { merge: true }), 3500).catch(() => {}));
   }
   await Promise.all(writes);
+};
+
+// ---------------------------------------------------------------------------
+// Deferred sign-up
+//
+// Registering does NOT create a Firebase Authentication account. The form data is parked in this
+// browser and a link is emailed (sendSignInLinkToEmail creates nothing). Only when that link is
+// used (signInWithEmailLink) is the account created, so it can never exist for an unverified or
+// mistyped email address.
+// ---------------------------------------------------------------------------
+const PENDING_SIGNUP_KEY = 'digipicture_pending_signup';
+const PENDING_SIGNUP_TTL_MS = 24 * 60 * 60 * 1000;
+
+export interface PendingSignup {
+  email: string;
+  /** PBKDF2 hash only; the plain password is never stored. Used to confirm the person re-types the same one. */
+  passwordHash: string;
+  profile: {
+    name: string;
+    firstName: string;
+    lastName: string;
+    username: string;
+    phone: string;
+    bio: string;
+    specialization: string;
+    categories: string[];
+    avatar: string;
+    profilePicUrl: string;
+  };
+  createdAt: number;
+}
+
+export const savePendingSignup = (pending: PendingSignup): boolean => {
+  try {
+    localStorage.setItem(PENDING_SIGNUP_KEY, JSON.stringify(pending));
+    return true;
+  } catch (err) {
+    console.warn('Could not save pending sign-up:', err);
+    return false;
+  }
+};
+
+export const clearPendingSignup = (): void => {
+  try { localStorage.removeItem(PENDING_SIGNUP_KEY); } catch (_) {}
+};
+
+export const getPendingSignup = (): PendingSignup | null => {
+  try {
+    const raw = localStorage.getItem(PENDING_SIGNUP_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PendingSignup;
+    if (!parsed?.email || !parsed?.passwordHash || !parsed?.profile) return null;
+    if (Date.now() - (parsed.createdAt || 0) > PENDING_SIGNUP_TTL_MS) {
+      clearPendingSignup();
+      return null;
+    }
+    return parsed;
+  } catch (_) {
+    return null;
+  }
+};
+
+/** Emails the "finish sign-up" link. Creates no account. Never throws; reports the outcome instead. */
+export const sendSignupVerificationLink = async (email: string): Promise<VerificationEmailResult> => {
+  const cleanEmail = email.trim().toLowerCase();
+  try {
+    await sendSignInLinkToEmail(auth, cleanEmail, {
+      url: `${window.location.origin}${window.location.pathname}?finish_signup=1`,
+      handleCodeInApp: true
+    });
+    return { sent: true, usedFallback: false };
+  } catch (err: any) {
+    console.warn('sendSignInLinkToEmail failed:', err?.code, err?.message || err);
+    return { sent: false, usedFallback: false, errorCode: err?.code || 'unknown', errorMessage: err?.message };
+  }
+};
+
+export const isSignupEmailLink = (href: string): boolean => {
+  try {
+    return isSignInWithEmailLink(auth, href);
+  } catch (_) {
+    return false;
+  }
+};
+
+// While the account is being finished the person is briefly signed in; the app-level auth
+// listener must ignore that session so the app never opens into the account by itself.
+let signupCompletionInProgress = false;
+export const isSignupCompletionInProgress = (): boolean => signupCompletionInProgress;
+
+const signupError = (code: string, message: string) => {
+  const err: any = new Error(message);
+  err.code = code;
+  return err;
+};
+
+/**
+ * Called when the person has opened the emailed link and confirmed their password.
+ * Creates the Firebase Auth account (already email-verified because the link proves ownership),
+ * sets the password, writes the profile, then signs out so the person logs in normally.
+ */
+export const completeSignupFromEmailLink = async (
+  href: string,
+  password: string
+): Promise<{ email: string; uid: string }> => {
+  const pending = getPendingSignup();
+  if (!pending) {
+    throw signupError('digipicture/no-pending-signup', 'No pending registration found in this browser.');
+  }
+  if (!isSignInWithEmailLink(auth, href)) {
+    throw signupError('auth/invalid-action-code', 'This verification link is not valid.');
+  }
+
+  signupCompletionInProgress = true;
+  try {
+    const cred = await signInWithEmailLink(auth, pending.email, href);
+
+    // The link signs in an EXISTING account too. Never overwrite someone's account or profile.
+    if (getAdditionalUserInfo(cred)?.isNewUser === false) {
+      try { await signOut(auth); } catch (_) {}
+      clearPendingSignup();
+      throw signupError('auth/email-already-in-use', 'This email address is already registered.');
+    }
+
+    try {
+      await updatePassword(cred.user, password);
+      await registerArtistWithFirebase({
+        uid: cred.user.uid,
+        email: pending.email,
+        ...pending.profile,
+        status: 'unapplied',
+        artistStatus: 'unapplied',
+        adminVerified: false,
+        artistApplicationSubmitted: false,
+        role: 'artist',
+        isNewRegistration: true
+      });
+    } catch (setupErr) {
+      // Never leave a half-built account (no password / no profile) behind.
+      try { await deleteUser(cred.user); } catch (_) { try { await signOut(auth); } catch (__) {} }
+      throw setupErr;
+    }
+
+    clearPendingSignup();
+    try { await signOut(auth); } catch (_) {}
+    return { email: pending.email, uid: cred.user.uid };
+  } finally {
+    signupCompletionInProgress = false;
+  }
 };
 
 export interface IncomingVerificationResult {

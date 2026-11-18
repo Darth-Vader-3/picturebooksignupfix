@@ -66,6 +66,8 @@ import {
   subscribeToBooks,
   verifyAndActivateArtistInFirestore,
   handleIncomingEmailVerification,
+  isSignupEmailLink,
+  isSignupCompletionInProgress,
   signOutFromFirebaseAndClearSession,
   purgeAllApplicationDataFromCloudAndLocal,
   auth,
@@ -174,7 +176,8 @@ export default function App() {
 
   const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
   const [authModalInitialStep, setAuthModalInitialStep] = useState<'role_select' | 'artist_auth' | 'student_setup'>('role_select');
-  const [authModalInitialTab, setAuthModalInitialTab] = useState<'login' | 'signup' | 'forgot_password' | 'email_verification'>('login');
+  const [authModalInitialTab, setAuthModalInitialTab] = useState<'login' | 'signup' | 'forgot_password' | 'email_verification' | 'complete_signup'>('login');
+  const [authModalCompleteSignupLink, setAuthModalCompleteSignupLink] = useState<string>('');
   const [authModalInitialEmail, setAuthModalInitialEmail] = useState<string>('');
   const [authModalSuccessNotice, setAuthModalSuccessNotice] = useState<string>('');
   const [showLegalModal, setShowLegalModal] = useState<boolean>(false);
@@ -292,6 +295,10 @@ export default function App() {
         // Email verification gate: Firebase signs a user in automatically the moment the account is
         // created (and again on every login attempt). An email/password account must NOT be treated
         // as logged in until its email address has been verified. (Google accounts are always verified.)
+        // Also ignore the short-lived session used while a sign-up is being finished from the emailed link.
+        if (isSignupCompletionInProgress()) {
+          return;
+        }
         const usesPasswordProvider = currentUser.providerData.some((p) => p.providerId === 'password');
         if (usesPasswordProvider && !currentUser.emailVerified) {
           return;
@@ -406,6 +413,19 @@ export default function App() {
         let searchParams = urlParams;
         if (!urlParams.get('verify_email') && !urlParams.get('email') && !urlParams.get('oobCode') && window.location.hash.includes('?')) {
           searchParams = new URLSearchParams(window.location.hash.substring(window.location.hash.indexOf('?')));
+        }
+
+        // Sign-up link from the email (account is only created in the next step, in the modal).
+        // Capture the full URL first: it is needed to complete the sign-in and then cleared.
+        const fullHref = window.location.href;
+        if (isSignupEmailLink(fullHref)) {
+          window.history.replaceState({}, document.title, window.location.pathname);
+          setAuthModalInitialStep('artist_auth');
+          setAuthModalInitialTab('complete_signup');
+          setAuthModalCompleteSignupLink(fullHref);
+          setAuthModalSuccessNotice('');
+          setShowAuthModal(true);
+          return;
         }
 
         // Nothing to do unless the URL actually carries a verification link / hint.
@@ -1958,6 +1978,7 @@ export default function App() {
               setShowAuthModal(false);
               setAuthModalInitialEmail('');
               setAuthModalSuccessNotice('');
+              setAuthModalCompleteSignupLink('');
             }}
             onAuthenticate={(account) => {
               setUserAccount(account);
@@ -1981,6 +2002,7 @@ export default function App() {
             initialAuthTab={authModalInitialTab}
             initialLoginEmail={authModalInitialEmail}
             initialSuccessNotice={authModalSuccessNotice}
+            initialCompleteSignupLink={authModalCompleteSignupLink}
           />
 
           {/* ==================== SETTINGS & USER PROFILE OVERLAY PANEL ==================== */}
