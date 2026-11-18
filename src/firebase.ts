@@ -4,17 +4,18 @@ import {
   getAuth, 
   createUserWithEmailAndPassword, 
   signInWithEmailAndPassword, 
+  sendSignInLinkToEmail,
+  isSignInWithEmailLink,
+  signInWithEmailLink,
+  EmailAuthProvider,
+  linkWithCredential,
+  updatePassword,
   GoogleAuthProvider,
   signInWithPopup,
   sendEmailVerification, 
   sendPasswordResetEmail,
   applyActionCode,
   checkActionCode,
-  sendSignInLinkToEmail,
-  isSignInWithEmailLink,
-  signInWithEmailLink,
-  updatePassword,
-  getAdditionalUserInfo,
   signOut,
   deleteUser,
   onAuthStateChanged,
@@ -1089,8 +1090,6 @@ export const registerArtistWithFirebase = async (artistData: {
   artistApplicationSubmitted?: boolean;
   artistApplicationDate?: string;
   createdAt?: any;
-  /** Treat this write as the creation of a brand-new profile (applies defaults + createdAt) even without a password. */
-  isNewRegistration?: boolean;
 }) => {
   const cleanEmail = artistData.email.trim().toLowerCase();
   const sanitizedEmailKey = cleanEmail.replace(/[^a-zA-Z0-9]/g, '_');
@@ -1101,38 +1100,35 @@ export const registerArtistWithFirebase = async (artistData: {
     uid = auth.currentUser.uid;
   }
 
-  // Result of the verification email attempt (null when no account was created/re-used in this call)
-  let verificationEmail: VerificationEmailResult | null = null;
-
   if (artistData.password && artistData.password.trim().length > 0) {
     try {
       const userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, artistData.password);
       user = userCredential.user;
       uid = user.uid;
 
-      // Send the verification email. This never throws: the outcome is reported back so the UI
-      // can tell the person honestly whether the email was sent instead of assuming success.
-      verificationEmail = await sendVerificationEmailSafely(user, cleanEmail);
+      // Send verification email with redirect to active deployment URL and email autofilled
+      try {
+        await sendEmailVerification(user, getEmailVerificationActionCodeSettings(cleanEmail));
+      } catch (verifErr) {
+        console.warn("sendEmailVerification notice:", verifErr);
+      }
     } catch (err: any) {
       if (err.code === 'auth/email-already-in-use') {
-        let existingCredential;
         try {
-          existingCredential = await signInWithEmailAndPassword(auth, cleanEmail, artistData.password);
+          const userCredential = await signInWithEmailAndPassword(auth, cleanEmail, artistData.password);
+          user = userCredential.user;
+          uid = user.uid;
+          if (!user.emailVerified) {
+            try {
+              await sendEmailVerification(user, getEmailVerificationActionCodeSettings(cleanEmail));
+            } catch (vErr) {
+              console.warn("Resend email verification notice:", vErr);
+            }
+          }
         } catch (signInErr) {
           console.warn("Sign in with existing email notice:", signInErr);
           throw err;
         }
-        user = existingCredential.user;
-        uid = user.uid;
-
-        // An already-verified account must log in, not sign up again.
-        if (user.emailVerified) {
-          try { await signOut(auth); } catch (_) {}
-          throw err;
-        }
-
-        // Account exists but was never verified (e.g. the first email never arrived): send a fresh link.
-        verificationEmail = await sendVerificationEmailSafely(user, cleanEmail);
       } else {
         console.warn("Firebase Auth create user notice:", err);
         throw err;
@@ -1176,7 +1172,7 @@ export const registerArtistWithFirebase = async (artistData: {
     ? artistData.categories
     : undefined;
 
-  const isCreatingNewAccount = Boolean(artistData.password && artistData.password.trim().length > 0) || Boolean(artistData.isNewRegistration);
+  const isCreatingNewAccount = Boolean(artistData.password && artistData.password.trim().length > 0);
   const resolvedStatus = artistData.status || (artistData.role === 'admin' ? 'approved' : (isCreatingNewAccount ? 'unapplied' : undefined));
 
   // Build non-destructive payload so partial updates (such as submitting an application)
@@ -1299,7 +1295,7 @@ export const registerArtistWithFirebase = async (artistData: {
     console.error(e);
   }
 
-  return { user, artistProfile: cachedProfile, verificationEmail };
+  return { user, artistProfile: cachedProfile };
 };
 
 const normalizeArtistSnapshotDoc = (docSnap: any): ArtistProfile => {
@@ -1912,9 +1908,17 @@ export const verifyAndActivateArtistInFirestore = async (email: string): Promise
   return isVerifiedInAuth;
 };
 
+let verificationFlowActive = false;
+
+export const setVerificationFlowActive = (active: boolean) => {
+  verificationFlowActive = active;
+};
+
+export const getVerificationFlowActive = (): boolean => verificationFlowActive;
+
 export const getEmailVerificationActionCodeSettings = (email: string) => {
   const cleanEmail = email.trim().toLowerCase();
-  const redirectUrl = new URL(window.location.pathname || '/', window.location.origin);
+  const redirectUrl = new URL('/verify', window.location.origin);
   if (cleanEmail) {
     redirectUrl.searchParams.set('verify_email', cleanEmail);
   }
@@ -1924,282 +1928,300 @@ export const getEmailVerificationActionCodeSettings = (email: string) => {
   };
 };
 
-export interface VerificationEmailResult {
-  sent: boolean;
-  /** True when the custom redirect URL was rejected and Firebase's default link was used instead. */
-  usedFallback: boolean;
-  errorCode?: string;
-  errorMessage?: string;
-}
+export const registerPendingArtistWithEmailLink = async (artistData: {
+  email: string;
+  name: string;
+  firstName?: string;
+  lastName?: string;
+  username?: string;
+  phone?: string;
+  bio?: string;
+  specialization?: string;
+  categories?: string[];
+  avatar?: string;
+  profilePicUrl?: string;
+}) => {
+  const cleanEmail = artistData.email.trim().toLowerCase();
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    throw new Error('Please enter a valid email address.');
+  }
 
-/**
- * Sends the Firebase verification email and reports the real outcome (never throws).
- *
- * The custom continue URL (this site) is rejected by Firebase with `auth/unauthorized-continue-uri`
- * when the current domain is not listed under Authentication > Settings > Authorized domains. Before,
- * that error was swallowed and the UI still claimed the email was sent. Now we retry with Firebase's
- * default action link so the email is still delivered, and we surface any remaining error.
- */
-export const sendVerificationEmailSafely = async (
-  user: FirebaseUser,
-  email?: string
-): Promise<VerificationEmailResult> => {
-  const targetEmail = (email || user.email || '').trim().toLowerCase();
+  // Prevent overwriting an already-verified artist account
+  try {
+    const [aSnap, uSnap] = await Promise.all([
+      withTimeout(getDocs(query(collection(db, 'artists'), where('email', '==', cleanEmail), limit(5))), 3000).catch(() => null),
+      withTimeout(getDocs(query(collection(db, 'users'), where('email', '==', cleanEmail), limit(5))), 3000).catch(() => null)
+    ]);
+    const existingDocs = [...(aSnap?.docs || []), ...(uSnap?.docs || [])];
+    const alreadyVerified = existingDocs.some((d) => {
+      const data = d.data();
+      return data?.isEmailVerified === true && !isSyntheticUid(data?.uid || d.id, cleanEmail);
+    });
+    if (alreadyVerified) {
+      const err: any = new Error('This email address is already registered and verified. Please log in instead.');
+      err.code = 'auth/email-already-in-use';
+      throw err;
+    }
+  } catch (checkErr: any) {
+    if (checkErr?.code === 'auth/email-already-in-use') {
+      throw checkErr;
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const pendingPayload = stripUndefinedDeep({
+    email: cleanEmail,
+    name: artistData.name.trim(),
+    firstName: artistData.firstName?.trim() || '',
+    lastName: artistData.lastName?.trim() || '',
+    username: artistData.username?.trim() || `@${cleanEmail.split('@')[0]}`,
+    phone: artistData.phone?.trim() || '',
+    bio: artistData.bio?.trim() || '',
+    specialization: artistData.specialization?.trim() || '',
+    categories: Array.isArray(artistData.categories) && artistData.categories.length > 0
+      ? artistData.categories
+      : ['Storybook Illustration'],
+    avatar: artistData.avatar || '🎨',
+    profilePicUrl: artistData.profilePicUrl?.trim() || '',
+    role: 'artist',
+    status: 'unapplied',
+    createdAt: nowIso,
+    updatedAt: nowIso
+  });
+
+  // Ensure no active Firebase Auth session remains open during registration
+  if (auth.currentUser) {
+    try {
+      await withTimeout(signOut(auth), 2500);
+    } catch (_) {}
+  }
+
+  // Save pending non-sensitive profile so /verify works seamlessly across devices
+  try {
+    await withTimeout(setDoc(doc(db, 'pending_registrations', cleanEmail), pendingPayload, { merge: true }), 6000);
+  } catch (fsErr) {
+    console.warn('Pending registration Firestore save notice:', fsErr);
+  }
 
   try {
-    await sendEmailVerification(user, getEmailVerificationActionCodeSettings(targetEmail));
-    return { sent: true, usedFallback: false };
-  } catch (primaryErr: any) {
-    console.warn("sendEmailVerification (custom redirect) failed:", primaryErr?.code, primaryErr?.message || primaryErr);
+    const existingPending = safeGetJSON<any[]>('digipicture_pending_registrations', []);
+    const filtered = Array.isArray(existingPending)
+      ? existingPending.filter((p) => p && p.email?.toLowerCase() !== cleanEmail)
+      : [];
+    filtered.push(pendingPayload);
+    safeSetItem('digipicture_pending_registrations', filtered);
+    safeSetItem('digipicture_email_for_signin', cleanEmail);
+  } catch (_) {}
 
-    // Retrying cannot help for these: report them as they are.
-    if (primaryErr?.code === 'auth/too-many-requests' || primaryErr?.code === 'auth/network-request-failed') {
-      return { sent: false, usedFallback: false, errorCode: primaryErr.code, errorMessage: primaryErr.message };
+  // Send Firebase Email Link WITHOUT creating a Firebase Auth user yet
+  try {
+    await sendSignInLinkToEmail(auth, cleanEmail, getEmailVerificationActionCodeSettings(cleanEmail));
+  } catch (linkErr: any) {
+    if (linkErr?.code === 'auth/operation-not-allowed' || linkErr?.code === 'auth/admin-restricted-operation') {
+      throw new Error(
+        'Email Link sign-in is not enabled yet in Firebase Console. Please enable "Email link (passwordless sign-in)" under Authentication > Sign-in method > Email/Password.'
+      );
     }
+    if (linkErr?.code === 'auth/unauthorized-continue-uri' || linkErr?.code === 'auth/invalid-continue-uri') {
+      throw new Error(
+        `This domain (${window.location.origin}) is not authorized in Firebase Authentication > Settings > Authorized domains.`
+      );
+    }
+    throw linkErr;
+  }
+
+  return pendingPayload;
+};
+
+export const resendVerificationLinkForEmail = async (email: string) => {
+  const cleanEmail = email.trim().toLowerCase();
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    throw new Error('Please enter a valid email address.');
+  }
+  safeSetItem('digipicture_email_for_signin', cleanEmail);
+  try {
+    await sendSignInLinkToEmail(auth, cleanEmail, getEmailVerificationActionCodeSettings(cleanEmail));
+  } catch (linkErr: any) {
+    if (linkErr?.code === 'auth/operation-not-allowed' || linkErr?.code === 'auth/admin-restricted-operation') {
+      throw new Error(
+        'Email Link sign-in is not enabled yet in Firebase Console. Please enable "Email link (passwordless sign-in)" under Authentication > Sign-in method > Email/Password.'
+      );
+    }
+    throw linkErr;
+  }
+};
+
+export const completeEmailLinkVerificationAndSetPassword = async (params: {
+  email: string;
+  actionUrl: string;
+  newPassword: string;
+}): Promise<{ email: string; uid: string }> => {
+  const cleanEmail = params.email.trim().toLowerCase();
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    throw new Error('Please enter the email address you registered with.');
+  }
+  if (!isSignInWithEmailLink(auth, params.actionUrl)) {
+    throw new Error('This verification link is invalid or has expired. Please request a new verification link.');
+  }
+
+  setVerificationFlowActive(true);
+  try {
+    const userCred = await signInWithEmailLink(auth, cleanEmail, params.actionUrl);
+    const user = userCred.user;
+
+    // Attach or update the user's newly created password on Firebase Auth
+    const hasPasswordProvider = user.providerData.some((p) => p?.providerId === 'password');
+    if (!hasPasswordProvider) {
+      try {
+        const credential = EmailAuthProvider.credential(cleanEmail, params.newPassword);
+        await linkWithCredential(user, credential);
+      } catch (linkErr: any) {
+        if (linkErr?.code === 'auth/provider-already-linked' || linkErr?.code === 'auth/credential-already-in-use') {
+          await updatePassword(user, params.newPassword);
+        } else {
+          throw linkErr;
+        }
+      }
+    } else {
+      await updatePassword(user, params.newPassword);
+    }
+
+    // Load pending registration profile (from Firestore first, then localStorage fallback)
+    let pendingDocData: any = null;
+    try {
+      const snap = await withTimeout(getDoc(doc(db, 'pending_registrations', cleanEmail)), 4000);
+      if (snap.exists()) {
+        pendingDocData = snap.data();
+      }
+    } catch (e) {
+      console.warn('Reading pending_registrations notice:', e);
+    }
+
+    if (!pendingDocData) {
+      const localPending = safeGetJSON<any[]>('digipicture_pending_registrations', []);
+      if (Array.isArray(localPending)) {
+        pendingDocData = localPending.find((p) => p && p.email?.toLowerCase() === cleanEmail) || null;
+      }
+    }
+
+    // Preserve any existing artist/user fields if re-verifying
+    const { artistDoc, userDoc } = await getUserAndArtistDoc(cleanEmail, user.uid).catch(() => ({
+      artistDoc: null,
+      userDoc: null,
+      pendingDoc: null
+    }));
+    const existingProfile = artistDoc || userDoc || {};
+
+    const nowIso = new Date().toISOString();
+    const resolvedName =
+      pendingDocData?.name ||
+      existingProfile?.name ||
+      user.displayName ||
+      cleanEmail.split('@')[0];
+
+    const activatedProfile = stripUndefinedDeep({
+      uid: user.uid,
+      email: cleanEmail,
+      name: resolvedName,
+      firstName: pendingDocData?.firstName ?? existingProfile?.firstName ?? '',
+      lastName: pendingDocData?.lastName ?? existingProfile?.lastName ?? '',
+      username: pendingDocData?.username || existingProfile?.username || `@${cleanEmail.split('@')[0]}`,
+      phone: pendingDocData?.phone ?? existingProfile?.phone ?? '',
+      bio: pendingDocData?.bio ?? existingProfile?.bio ?? '',
+      specialization: pendingDocData?.specialization ?? existingProfile?.specialization ?? '',
+      categories:
+        (Array.isArray(pendingDocData?.categories) && pendingDocData.categories.length > 0
+          ? pendingDocData.categories
+          : existingProfile?.categories) || ['Storybook Illustration'],
+      avatar: pendingDocData?.avatar || existingProfile?.avatar || '🎨',
+      profilePicUrl: pendingDocData?.profilePicUrl ?? existingProfile?.profilePicUrl ?? '',
+      sampleImageUrl: existingProfile?.sampleImageUrl ?? '',
+      role: existingProfile?.role || 'artist',
+      status: existingProfile?.status && existingProfile.status !== 'unapplied' ? existingProfile.status : 'unapplied',
+      artistStatus:
+        existingProfile?.artistStatus && existingProfile.artistStatus !== 'unapplied'
+          ? existingProfile.artistStatus
+          : 'unapplied',
+      adminVerified: Boolean(existingProfile?.adminVerified),
+      artistApplicationSubmitted: Boolean(existingProfile?.artistApplicationSubmitted),
+      isEmailVerified: true,
+      updatedAt: nowIso,
+      createdAt: pendingDocData?.createdAt || existingProfile?.createdAt || nowIso
+    });
+
+    await Promise.all([
+      withTimeout(setDoc(doc(db, 'artists', user.uid), activatedProfile, { merge: true }), 5000),
+      withTimeout(setDoc(doc(db, 'users', user.uid), activatedProfile, { merge: true }), 5000),
+      withTimeout(setDoc(doc(db, 'artists', cleanEmail), activatedProfile, { merge: true }), 5000),
+      withTimeout(deleteDoc(doc(db, 'pending_registrations', cleanEmail)), 3000).catch(() => {})
+    ]);
 
     try {
-      await sendEmailVerification(user);
-      return { sent: true, usedFallback: true, errorCode: primaryErr?.code };
-    } catch (fallbackErr: any) {
-      console.warn("sendEmailVerification (default link) failed:", fallbackErr?.code, fallbackErr?.message || fallbackErr);
-      return {
-        sent: false,
-        usedFallback: true,
-        errorCode: fallbackErr?.code || primaryErr?.code,
-        errorMessage: fallbackErr?.message || primaryErr?.message
-      };
-    }
+      const registered = safeGetJSON<any[]>('digipicture_registered_artists', []);
+      const filteredReg = Array.isArray(registered)
+        ? registered.filter((a: any) => a && a.email?.toLowerCase() !== cleanEmail)
+        : [];
+      filteredReg.push(activatedProfile);
+      safeSetItem('digipicture_registered_artists', filteredReg);
+
+      const localPending = safeGetJSON<any[]>('digipicture_pending_registrations', []);
+      if (Array.isArray(localPending)) {
+        safeSetItem(
+          'digipicture_pending_registrations',
+          localPending.filter((a: any) => a && a.email?.toLowerCase() !== cleanEmail)
+        );
+      }
+      localStorage.removeItem('digipicture_email_for_signin');
+    } catch (_) {}
+
+    // Enforce explicit login: sign out immediately after account creation & password linking
+    try {
+      sessionStorage.removeItem('digipicture_auth_token');
+    } catch (_) {}
+    await withTimeout(signOut(auth), 4000).catch(() => {});
+
+    return { email: cleanEmail, uid: user.uid };
+  } finally {
+    setVerificationFlowActive(false);
   }
 };
 
 export const sendVerificationEmail = async (user?: FirebaseUser) => {
   const currentUser = user || auth.currentUser;
   if (currentUser) {
-    const result = await sendVerificationEmailSafely(currentUser, currentUser.email || '');
-    if (!result.sent) {
-      const err: any = new Error(result.errorMessage || 'Could not send verification email.');
-      err.code = result.errorCode;
-      throw err;
-    }
+    const email = currentUser.email || '';
+    await sendEmailVerification(currentUser, getEmailVerificationActionCodeSettings(email));
   }
 };
 
 /**
- * Called only after Firebase Auth has confirmed the email is verified (a successful login with
- * emailVerified === true). Keeps the Firestore profile documents in sync with that fact.
+ * Handle incoming email verification links from URL search parameters,
+ * applying Firebase Auth action codes if present, and activating the artist in Firestore.
  */
-export const markEmailVerifiedInFirestore = async (uid: string | undefined, email: string): Promise<void> => {
-  const cleanEmail = (email || '').trim().toLowerCase();
-  const payload = { isEmailVerified: true, updatedAt: new Date().toISOString() };
-  const writes: Promise<any>[] = [];
-  if (uid) {
-    writes.push(withTimeout(setDoc(doc(db, 'artists', uid), payload, { merge: true }), 3500).catch(() => {}));
-    writes.push(withTimeout(setDoc(doc(db, 'users', uid), payload, { merge: true }), 3500).catch(() => {}));
-  }
-  if (cleanEmail.includes('@')) {
-    writes.push(withTimeout(setDoc(doc(db, 'artists', cleanEmail), payload, { merge: true }), 3500).catch(() => {}));
-  }
-  await Promise.all(writes);
-};
-
-// ---------------------------------------------------------------------------
-// Deferred sign-up
-//
-// Registering does NOT create a Firebase Authentication account. The form data is parked in this
-// browser and a link is emailed (sendSignInLinkToEmail creates nothing). Only when that link is
-// used (signInWithEmailLink) is the account created, so it can never exist for an unverified or
-// mistyped email address.
-// ---------------------------------------------------------------------------
-const PENDING_SIGNUP_KEY = 'digipicture_pending_signup';
-const PENDING_SIGNUP_TTL_MS = 24 * 60 * 60 * 1000;
-
-export interface PendingSignup {
-  email: string;
-  /** PBKDF2 hash only; the plain password is never stored. Used to confirm the person re-types the same one. */
-  passwordHash: string;
-  profile: {
-    name: string;
-    firstName: string;
-    lastName: string;
-    username: string;
-    phone: string;
-    bio: string;
-    specialization: string;
-    categories: string[];
-    avatar: string;
-    profilePicUrl: string;
-  };
-  createdAt: number;
-}
-
-export const savePendingSignup = (pending: PendingSignup): boolean => {
-  try {
-    localStorage.setItem(PENDING_SIGNUP_KEY, JSON.stringify(pending));
-    return true;
-  } catch (err) {
-    console.warn('Could not save pending sign-up:', err);
-    return false;
-  }
-};
-
-export const clearPendingSignup = (): void => {
-  try { localStorage.removeItem(PENDING_SIGNUP_KEY); } catch (_) {}
-};
-
-export const getPendingSignup = (): PendingSignup | null => {
-  try {
-    const raw = localStorage.getItem(PENDING_SIGNUP_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as PendingSignup;
-    if (!parsed?.email || !parsed?.passwordHash || !parsed?.profile) return null;
-    if (Date.now() - (parsed.createdAt || 0) > PENDING_SIGNUP_TTL_MS) {
-      clearPendingSignup();
-      return null;
-    }
-    return parsed;
-  } catch (_) {
-    return null;
-  }
-};
-
-/** Emails the "finish sign-up" link. Creates no account. Never throws; reports the outcome instead. */
-export const sendSignupVerificationLink = async (email: string): Promise<VerificationEmailResult> => {
-  const cleanEmail = email.trim().toLowerCase();
-  try {
-    await sendSignInLinkToEmail(auth, cleanEmail, {
-      url: `${window.location.origin}${window.location.pathname}?finish_signup=1`,
-      handleCodeInApp: true
-    });
-    return { sent: true, usedFallback: false };
-  } catch (err: any) {
-    console.warn('sendSignInLinkToEmail failed:', err?.code, err?.message || err);
-    return { sent: false, usedFallback: false, errorCode: err?.code || 'unknown', errorMessage: err?.message };
-  }
-};
-
-export const isSignupEmailLink = (href: string): boolean => {
-  try {
-    return isSignInWithEmailLink(auth, href);
-  } catch (_) {
-    return false;
-  }
-};
-
-// While the account is being finished the person is briefly signed in; the app-level auth
-// listener must ignore that session so the app never opens into the account by itself.
-let signupCompletionInProgress = false;
-export const isSignupCompletionInProgress = (): boolean => signupCompletionInProgress;
-
-const signupError = (code: string, message: string) => {
-  const err: any = new Error(message);
-  err.code = code;
-  return err;
-};
-
-/**
- * Called when the person has opened the emailed link and confirmed their password.
- * Creates the Firebase Auth account (already email-verified because the link proves ownership),
- * sets the password, writes the profile, then signs out so the person logs in normally.
- */
-export const completeSignupFromEmailLink = async (
-  href: string,
-  password: string
-): Promise<{ email: string; uid: string }> => {
-  const pending = getPendingSignup();
-  if (!pending) {
-    throw signupError('digipicture/no-pending-signup', 'No pending registration found in this browser.');
-  }
-  if (!isSignInWithEmailLink(auth, href)) {
-    throw signupError('auth/invalid-action-code', 'This verification link is not valid.');
-  }
-
-  signupCompletionInProgress = true;
-  try {
-    const cred = await signInWithEmailLink(auth, pending.email, href);
-
-    // The link signs in an EXISTING account too. Never overwrite someone's account or profile.
-    if (getAdditionalUserInfo(cred)?.isNewUser === false) {
-      try { await signOut(auth); } catch (_) {}
-      clearPendingSignup();
-      throw signupError('auth/email-already-in-use', 'This email address is already registered.');
-    }
-
-    try {
-      await updatePassword(cred.user, password);
-      await registerArtistWithFirebase({
-        uid: cred.user.uid,
-        email: pending.email,
-        ...pending.profile,
-        status: 'unapplied',
-        artistStatus: 'unapplied',
-        adminVerified: false,
-        artistApplicationSubmitted: false,
-        role: 'artist',
-        isNewRegistration: true
-      });
-    } catch (setupErr) {
-      // Never leave a half-built account (no password / no profile) behind.
-      try { await deleteUser(cred.user); } catch (_) { try { await signOut(auth); } catch (__) {} }
-      throw setupErr;
-    }
-
-    clearPendingSignup();
-    try { await signOut(auth); } catch (_) {}
-    return { email: pending.email, uid: cred.user.uid };
-  } finally {
-    signupCompletionInProgress = false;
-  }
-};
-
-export interface IncomingVerificationResult {
-  email: string;
-  /** True only when Firebase confirmed it (the action code was valid and was applied just now). */
-  verified: boolean;
-  /** Set when the link was invalid, expired or already used. */
-  errorCode?: string;
-}
-
-/**
- * Handle incoming email verification links from URL search parameters.
- *
- * Only a valid Firebase `oobCode` (applied with applyActionCode) counts as "verified". A bare
- * `?verify_email=someone@example.com` in the URL proves nothing, so it is returned as a hint
- * (verified: false) that only pre-fills the login form. Real verification is always enforced at
- * login time through Firebase Auth's `emailVerified` flag.
- */
-export const handleIncomingEmailVerification = async (
-  searchParams: URLSearchParams
-): Promise<IncomingVerificationResult | null> => {
+export const handleIncomingEmailVerification = async (searchParams: URLSearchParams): Promise<string | null> => {
   const oobCode = searchParams.get('oobCode');
   const mode = searchParams.get('mode');
   let email = searchParams.get('verify_email') || searchParams.get('email') || null;
 
-  if (oobCode && (mode === 'verifyEmail' || !mode)) {
+  if (oobCode && mode === 'verifyEmail') {
     try {
       const info = await checkActionCode(auth, oobCode);
       if (info?.data?.email) {
         email = info.data.email;
       }
       await applyActionCode(auth, oobCode);
-
-      if (email) {
-        const cleanEmail = email.trim().toLowerCase();
-        await verifyAndActivateArtistInFirestore(cleanEmail);
-        return { email: cleanEmail, verified: true };
-      }
-      return null;
-    } catch (err: any) {
-      // Expired / already-used links are common (email scanners often open links first),
-      // so the person is sent to log in, where the real verification state is checked.
-      console.warn("Firebase applyActionCode notice:", err?.code, err?.message || err);
-      return email
-        ? { email: email.trim().toLowerCase(), verified: false, errorCode: err?.code || 'auth/invalid-action-code' }
-        : null;
+    } catch (err) {
+      console.warn("Firebase applyActionCode notice:", err);
     }
   }
 
   if (email) {
-    return { email: email.trim().toLowerCase(), verified: false };
+    const cleanEmail = email.trim().toLowerCase();
+    await verifyAndActivateArtistInFirestore(cleanEmail);
+    if (auth.currentUser) {
+      await signOut(auth).catch(() => {});
+    }
+    return cleanEmail;
   }
   return null;
 };
@@ -2722,6 +2744,9 @@ export {
   sendPasswordResetEmail, 
   signInWithEmailAndPassword, 
   createUserWithEmailAndPassword,
+  sendSignInLinkToEmail,
+  isSignInWithEmailLink,
+  signInWithEmailLink,
   sendEmailVerification,
   signOut, 
   onAuthStateChanged,

@@ -2,19 +2,20 @@ import React, { useState, useEffect, useRef } from 'react';
 import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
 import {
-  savePendingSignup,
-  getPendingSignup,
-  clearPendingSignup,
-  sendSignupVerificationLink,
-  completeSignupFromEmailLink,
+  registerArtistWithFirebase,
+  registerPendingArtistWithEmailLink,
+  resendVerificationLinkForEmail,
+  verifyAndActivateArtistInFirestore,
   sendPasswordResetEmail,
-  sendVerificationEmailSafely,
-  markEmailVerifiedInFirestore,
+  sendVerificationEmail,
+  sendEmailVerification,
+  getEmailVerificationActionCodeSettings,
   signOutFromFirebaseAndClearSession,
   resolveEmailFromIdentifier,
   fetchArtistsFromFirestore,
   getUserAndArtistDoc,
   signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
   signOut,
   auth,
   db
@@ -57,11 +58,10 @@ interface AuthModalProps {
   theme?: 'day' | 'night';
   onLogout?: () => Promise<void> | void;
   initialStep?: 'role_select' | 'artist_auth' | 'student_setup';
-  initialAuthTab?: 'login' | 'signup' | 'forgot_password' | 'email_verification' | 'complete_signup';
+  initialAuthTab?: 'login' | 'signup' | 'forgot_password' | 'email_verification';
   initialLoginEmail?: string;
   initialSuccessNotice?: string;
-  /** Full URL of the emailed sign-up link (set when the person opens it); account is created from it. */
-  initialCompleteSignupLink?: string;
+  onRegistrationPendingVerification?: (email: string, fullName?: string) => void;
 }
 
 const ARTIST_CATEGORIES = [
@@ -88,7 +88,7 @@ export default function AuthModal({
   initialAuthTab,
   initialLoginEmail,
   initialSuccessNotice,
-  initialCompleteSignupLink
+  onRegistrationPendingVerification
 }: AuthModalProps) {
   const isNight = theme === 'night';
 
@@ -97,36 +97,20 @@ export default function AuthModal({
   const [step, setStep] = useState<'role_select' | 'artist_auth' | 'student_setup'>('role_select');
   
   // Artist auth tab: 'login' | 'signup' | 'forgot_password' | 'email_verification'
-  const [authTab, setAuthTab] = useState<'login' | 'signup' | 'forgot_password' | 'email_verification' | 'complete_signup'>('login');
-
-  // Finishing sign-up from the emailed link (the Firebase account is created in this step)
-  const [completeSignupHref, setCompleteSignupHref] = useState<string>('');
-  const [completePassword, setCompletePassword] = useState<string>('');
-  const [isCompletingSignup, setIsCompletingSignup] = useState<boolean>(false);
-  const [isSendingSignupLink, setIsSendingSignupLink] = useState<boolean>(false);
-  const [completeSignupProblem, setCompleteSignupProblem] = useState<null | 'expired' | 'no_pending'>(null);
-  // Which kind of account the verification screen is about:
-  //  - 'pending_signup': registered, NOT yet created in Firebase (link emailed, account made after the click)
-  //  - 'legacy_account': an account that already exists in Firebase but was never verified
-  const [verificationMode, setVerificationMode] = useState<'pending_signup' | 'legacy_account'>('pending_signup');
+  const [authTab, setAuthTab] = useState<'login' | 'signup' | 'forgot_password' | 'email_verification'>('login');
 
   // Synchronize initial state when opening or when initial props update
   useEffect(() => {
     if (isOpen) {
       if (initialStep) setStep(initialStep);
       if (initialAuthTab) setAuthTab(initialAuthTab);
-      if (initialCompleteSignupLink) {
-        setCompleteSignupHref(initialCompleteSignupLink);
-        setCompleteSignupProblem(null);
-        setCompletePassword('');
-      }
       if (initialLoginEmail) setLoginIdentifier(initialLoginEmail);
       if (initialSuccessNotice) {
         setSuccessNotice(initialSuccessNotice);
         setErrorMessage(null);
       }
     }
-  }, [isOpen, initialStep, initialAuthTab, initialLoginEmail, initialSuccessNotice, initialCompleteSignupLink]);
+  }, [isOpen, initialStep, initialAuthTab, initialLoginEmail, initialSuccessNotice]);
 
   // Forgot Password state
   const [resetEmail, setResetEmail] = useState('');
@@ -201,8 +185,7 @@ export default function AuthModal({
   const setSignupCategories = setSelectedCategories;
   const [signupSpecialization, setSignupSpecialization] = useState('Storybook Illustration, Sculpture & Clay');
   const [signupBio, setSignupBio] = useState('');
-  const [signupPassword, setSignupPassword] = useState('');
-  const [signupConfirmPassword, setSignupConfirmPassword] = useState('');
+  const [isSigningUp, setIsSigningUp] = useState(false);
 
   // Student quick setup state
   const [studentName, setStudentName] = useState('Student Reader');
@@ -217,39 +200,6 @@ export default function AuthModal({
   const [pendingVerificationEmail, setPendingVerificationEmail] = useState<string | null>(null);
   const [pendingVerificationName, setPendingVerificationName] = useState<string>('');
   const [showVerificationBox, setShowVerificationBox] = useState<boolean>(false);
-  // Error code when the verification email could NOT be sent (null = it was sent successfully)
-  const [verificationSendError, setVerificationSendError] = useState<string | null>(null);
-  const [isResendingVerification, setIsResendingVerification] = useState<boolean>(false);
-  const [resendCooldown, setResendCooldown] = useState<number>(0);
-  // Kept in memory only (never stored) so "Resend" can work right after sign-up. Cleared on close/login.
-  const pendingPasswordRef = useRef<string | null>(null);
-
-  // The link usually opens in a NEW tab. When that tab finishes the sign-up it clears the pending
-  // registration; this (original) tab then stops waiting and moves on to the login screen.
-  useEffect(() => {
-    const onStorage = (ev: StorageEvent) => {
-      if (ev.key === 'digipicture_pending_signup' && ev.newValue === null && authTab === 'email_verification' && verificationMode === 'pending_signup') {
-        setLoginIdentifier(pendingVerificationEmail || '');
-        setLoginPassword('');
-        setErrorMessage(null);
-        setSuccessNotice(
-          language === 'en'
-            ? 'Your email is verified and your account has been created. Please log in.'
-            : 'Barua pepe yako imethibitishwa na akaunti yako imetengenezwa. Tafadhali ingia.'
-        );
-        setAuthTab('login');
-      }
-    };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
-  }, [authTab, verificationMode, pendingVerificationEmail, language]);
-
-  // Countdown for the "Resend verification email" button
-  useEffect(() => {
-    if (resendCooldown <= 0) return;
-    const timer = setTimeout(() => setResendCooldown((c) => Math.max(0, c - 1)), 1000);
-    return () => clearTimeout(timer);
-  }, [resendCooldown]);
 
   // Helper to load registered artists from localStorage with initial seeds if empty
   const getRegisteredArtists = (): any[] => {
@@ -333,6 +283,52 @@ export default function AuthModal({
     }
   };
 
+  const verifyEmailAndRedirectToLogin = async (emailToVerify: string) => {
+    const clean = emailToVerify.trim().toLowerCase();
+
+    // Activate in Firebase Firestore database
+    await verifyAndActivateArtistInFirestore(clean);
+    
+    // Check pending registrations first
+    let pendingList = getPendingRegistrations();
+    const pendingAccount = Array.isArray(pendingList) ? pendingList.find((a: any) => a && a.email?.toLowerCase() === clean) : null;
+
+    const registered = getRegisteredArtists();
+    let foundIndex = Array.isArray(registered) ? registered.findIndex((a: any) => a && a.email?.toLowerCase() === clean) : -1;
+
+    if (pendingAccount) {
+      // Save account to registered artists list now that email is verified!
+      const verifiedAccount = { ...pendingAccount, isEmailVerified: true };
+      if (foundIndex !== -1) {
+        registered[foundIndex] = verifiedAccount;
+      } else {
+        registered.push(verifiedAccount);
+      }
+      safeSetItem('digipicture_registered_artists', registered);
+
+      // Remove from pending registrations
+      pendingList = Array.isArray(pendingList) ? pendingList.filter((a: any) => a && a.email?.toLowerCase() !== clean) : [];
+      safeSetItem('digipicture_pending_registrations', pendingList);
+    } else if (foundIndex !== -1) {
+      registered[foundIndex].isEmailVerified = true;
+      safeSetItem('digipicture_registered_artists', registered);
+    }
+
+    // Redirect to login tab in AuthModal
+    setStep('artist_auth');
+    setAuthTab('login');
+    setLoginIdentifier(clean);
+    setLoginPassword('');
+    setShowVerificationBox(false);
+    setErrorMessage(null);
+    setSuccessNotice(
+      language === 'en'
+        ? `🎉 Email verified successfully for ${clean}! Your studio account has been created and saved. Please enter your password to log in.`
+        : `🎉 Barua pepe ${clean} imethibitishwa kwa mafanikio! Akaunti yako imeundwa na kuhifadhiwa. Ingiza nenosiri lako ili kuingia.`
+    );
+    playChime('sparkle');
+  };
+
   if (!isOpen) return null;
 
   const toggleCategory = (cat: string) => {
@@ -359,139 +355,6 @@ export default function AuthModal({
       setSignupSpecialization(formattedSpecialization);
       return nextCategories;
     });
-  };
-
-  const describeVerificationSendError = (code: string | null): string => {
-    const en = language === 'en';
-    if (code === 'auth/too-many-requests') {
-      return en
-        ? 'Too many verification emails were requested for this address. Please wait a few minutes, then press "Resend verification email".'
-        : 'Barua pepe nyingi za uthibitisho zimeombwa kwa anwani hii. Tafadhali subiri dakika chache, kisha bonyeza "Tuma tena".';
-    }
-    if (code === 'auth/operation-not-allowed') {
-      return en
-        ? 'Sign-up emails are not switched on yet. (Firebase Console → Authentication → Sign-in method → Email/Password → enable "Email link (passwordless sign-in)".)'
-        : 'Barua pepe za kujisajili hazijawashwa bado. (Firebase Console → Authentication → Sign-in method → Email/Password → washa "Email link (passwordless sign-in)".)';
-    }
-    if (code === 'auth/unauthorized-continue-uri' || code === 'auth/invalid-continue-uri' || code === 'auth/missing-continue-uri') {
-      return en
-        ? 'This website address is not authorised in Firebase yet. (Firebase Console → Authentication → Settings → Authorized domains → add this domain.)'
-        : 'Anwani ya tovuti hii haijaidhinishwa kwenye Firebase bado. (Firebase Console → Authentication → Settings → Authorized domains → ongeza domain hii.)';
-    }
-    if (code === 'auth/invalid-email') {
-      return en ? 'That email address does not look valid. Please check it and try again.' : 'Anwani hiyo ya barua pepe si halali. Tafadhali ikague na ujaribu tena.';
-    }
-    if (code === 'auth/network-request-failed') {
-      return en
-        ? 'Network problem while sending the email. Check your connection and press "Resend verification email".'
-        : 'Tatizo la mtandao wakati wa kutuma barua pepe. Kagua mtandao wako kisha bonyeza "Tuma tena".';
-    }
-    return en
-      ? 'The verification email could not be sent right now. Please press "Resend verification email" to try again.'
-      : 'Barua pepe ya uthibitisho haikuweza kutumwa sasa. Tafadhali bonyeza "Tuma tena" kujaribu tena.';
-  };
-
-  const handleResendVerification = async () => {
-    if (isResendingVerification || resendCooldown > 0) return;
-    const email = (pendingVerificationEmail || '').trim().toLowerCase();
-    if (!email) return;
-    setErrorMessage(null);
-    setSuccessNotice(null);
-
-    // Registered but not yet created in Firebase: just send the link again (no password needed).
-    if (verificationMode === 'pending_signup') {
-      if (!getPendingSignup()) {
-        setAuthTab('signup');
-        setErrorMessage(
-          language === 'en'
-            ? 'Your registration has expired. Please sign up again.'
-            : 'Usajili wako umeisha muda. Tafadhali jisajili tena.'
-        );
-        return;
-      }
-      setIsResendingVerification(true);
-      try {
-        const result = await sendSignupVerificationLink(email);
-        if (result.sent) {
-          setVerificationSendError(null);
-          setResendCooldown(60);
-          setSuccessNotice(
-            language === 'en'
-              ? `A new verification link was sent to ${email}. Please check your inbox and spam folder.`
-              : `Kiungo kipya cha uthibitisho kimetumwa kwa ${email}. Tafadhali kagua kikasha chako na folda ya spam.`
-          );
-          playChime('sparkle');
-        } else {
-          setVerificationSendError(result.errorCode || 'unknown');
-          setResendCooldown(result.errorCode === 'auth/too-many-requests' ? 120 : 30);
-        }
-      } finally {
-        setIsResendingVerification(false);
-      }
-      return;
-    }
-
-    const savedPassword = pendingPasswordRef.current;
-    if (!savedPassword || !auth) {
-      // The password is no longer in memory (modal was closed/reopened): a normal log-in attempt
-      // re-sends the verification link automatically while the email is still unverified.
-      setAuthTab('login');
-      setLoginIdentifier(email);
-      setLoginPassword('');
-      setSuccessNotice(
-        language === 'en'
-          ? 'Enter your password and press Log In. If your email is still unverified, we will send you a fresh verification link.'
-          : 'Ingiza nenosiri lako na ubonyeze Ingia. Kama barua pepe bado haijathibitishwa, tutakutumia kiungo kipya cha uthibitisho.'
-      );
-      return;
-    }
-
-    setIsResendingVerification(true);
-    try {
-      const cred = await signInWithEmailAndPassword(auth, email, savedPassword);
-      if (cred.user.emailVerified) {
-        try { await signOut(auth); } catch (_) {}
-        pendingPasswordRef.current = null;
-        setAuthTab('login');
-        setLoginIdentifier(email);
-        setLoginPassword('');
-        setSuccessNotice(
-          language === 'en'
-            ? 'Your email is already verified. Enter your password to log in.'
-            : 'Barua pepe yako tayari imethibitishwa. Ingiza nenosiri lako ili kuingia.'
-        );
-        return;
-      }
-
-      const result = await sendVerificationEmailSafely(cred.user, email);
-      try { await signOut(auth); } catch (_) {}
-
-      if (result.sent) {
-        setVerificationSendError(null);
-        setResendCooldown(60);
-        setSuccessNotice(
-          language === 'en'
-            ? `A new verification link was sent to ${email}. Please check your inbox and spam folder.`
-            : `Kiungo kipya cha uthibitisho kimetumwa kwa ${email}. Tafadhali kagua kikasha chako na folda ya spam.`
-        );
-        playChime('sparkle');
-      } else {
-        setVerificationSendError(result.errorCode || 'unknown');
-        setResendCooldown(result.errorCode === 'auth/too-many-requests' ? 120 : 30);
-      }
-    } catch (err: any) {
-      console.warn('Resend verification notice:', err?.code || err);
-      try { await signOut(auth); } catch (_) {}
-      setErrorMessage(
-        err?.code === 'auth/too-many-requests'
-          ? describeVerificationSendError('auth/too-many-requests')
-          : (language === 'en'
-              ? 'Could not resend the verification email. Please try again in a moment.'
-              : 'Imeshindwa kutuma tena barua pepe ya uthibitisho. Tafadhali jaribu tena baadaye.')
-      );
-    } finally {
-      setIsResendingVerification(false);
-    }
   };
 
   const handleArtistLoginSubmit = async (e: React.FormEvent) => {
@@ -574,15 +437,6 @@ export default function AuthModal({
         ) {
           const isSpecialAdmin = (foundIndex !== -1 && registeredArtists[foundIndex]?.role === 'admin') || cleanInput === 'yamauchiryoko16@gmail.com' || resolvedEmail === 'yamauchiryoko16@gmail.com';
           if (!isSpecialAdmin) {
-            const waiting = getPendingSignup();
-            if (waiting && waiting.email === resolvedEmail.toLowerCase()) {
-              setErrorMessage(
-                language === 'en'
-                  ? 'Your email is not verified yet, so your account has not been created. Open the verification link we emailed you, then log in.'
-                  : 'Barua pepe yako haijathibitishwa bado, kwa hiyo akaunti yako haijatengenezwa. Fungua kiungo cha uthibitisho tulichokutumia, kisha ingia.'
-              );
-              return;
-            }
             setErrorMessage(INVALID_CREDENTIALS_MSG);
             return;
           }
@@ -600,24 +454,28 @@ export default function AuthModal({
     // Requirement 2: Strict Email Verification Enforcement on Login
     if (firebaseUser) {
       if (!firebaseUser.emailVerified) {
-        // Not verified yet: send a fresh link (reporting the real outcome), then sign out again so
-        // the account can never be used until the email has been verified.
-        const resend = await sendVerificationEmailSafely(firebaseUser, firebaseUser.email || resolvedEmail);
+        try {
+          await sendEmailVerification(
+            firebaseUser,
+            getEmailVerificationActionCodeSettings(firebaseUser.email || resolvedEmail)
+          );
+        } catch (vErr) {
+          console.warn("Resend email verification notice:", vErr);
+        }
         try {
           await signOut(auth);
         } catch (sErr) {
           console.warn("Sign out notice:", sErr);
         }
-        pendingPasswordRef.current = loginPassword;
-        setVerificationMode('legacy_account');
-        setVerificationSendError(resend.sent ? null : (resend.errorCode || 'unknown'));
-        setPendingVerificationEmail(resolvedEmail || firebaseUser.email || '');
-        setAuthTab('email_verification');
+        const targetPendingEmail = resolvedEmail || firebaseUser.email || '';
+        if (onRegistrationPendingVerification) {
+          onRegistrationPendingVerification(targetPendingEmail);
+        } else {
+          setPendingVerificationEmail(targetPendingEmail);
+          setAuthTab('email_verification');
+        }
         return;
       }
-
-      // Firebase confirms the email is verified: keep our own records in step with that.
-      markEmailVerifiedInFirestore(firebaseUser.uid, firebaseUser.email || resolvedEmail).catch(() => {});
     }
 
     // Always pull latest cloud profile from Firestore (even if found locally in localStorage)
@@ -665,11 +523,6 @@ export default function AuthModal({
       return;
     }
 
-    if (firebaseUser?.emailVerified && foundIndex !== -1) {
-      registeredArtists[foundIndex].isEmailVerified = true;
-      safeSetItem('digipicture_registered_artists', registeredArtists);
-    }
-
     const found = foundIndex !== -1 ? registeredArtists[foundIndex] : {
       uid: firebaseUser?.uid,
       role: 'artist',
@@ -710,11 +563,15 @@ export default function AuthModal({
       }
     }
 
-    if (found && found.role !== 'admin' && found.isEmailVerified !== true && !firebaseAuthSucceeded) {
-      setVerificationMode(getPendingSignup()?.email === (resolvedEmail || found.email || '').toLowerCase() ? 'pending_signup' : 'legacy_account');
-      setVerificationSendError(null);
-      setPendingVerificationEmail(resolvedEmail || found.email || '');
-      setAuthTab('email_verification');
+    if (found && found.role !== 'admin' && found.isEmailVerified === false && !firebaseAuthSucceeded) {
+      const targetPendingEmail = resolvedEmail || found.email || '';
+      await resendVerificationLinkForEmail(targetPendingEmail).catch(() => {});
+      if (onRegistrationPendingVerification) {
+        onRegistrationPendingVerification(targetPendingEmail);
+      } else {
+        setPendingVerificationEmail(targetPendingEmail);
+        setAuthTab('email_verification');
+      }
       return;
     }
 
@@ -754,7 +611,6 @@ export default function AuthModal({
       isLoggedIn: true
     };
 
-    pendingPasswordRef.current = null;
     playChime('sparkle');
     onAuthenticate(authenticatedAccount);
     onClose();
@@ -994,14 +850,13 @@ export default function AuthModal({
     const fullName = `${signupFirstName.trim()} ${signupLastName.trim()}`;
     const cleanEmail = signupEmail.trim().toLowerCase();
 
-    // Zod Schema Validation
+    // Zod Schema Validation (password is deferred until /verify after clicking the email link)
     const validationResult = validateWithSchema(UserRegistrationSchema, {
       firstName: signupFirstName.trim(),
       lastName: signupLastName.trim(),
       name: fullName,
       email: cleanEmail,
       username: signupUsername.trim() || undefined,
-      password: signupPassword,
       phone: signupPhone.trim(),
       avatar: signupAvatar,
       profilePicUrl: signupProfilePicUrl.trim(),
@@ -1020,151 +875,55 @@ export default function AuthModal({
       setErrorMessage(language === 'en' ? 'Please enter a valid email address.' : 'Ingiza barua pepe halali.');
       return;
     }
-    if (!signupPassword) {
-      setErrorMessage(language === 'en' ? 'Please create a password.' : 'Tengeneza nenosiri.');
-      return;
-    }
-    if (signupPassword.length <= 7) {
-      setErrorMessage(
-        language === 'en'
-          ? 'Password must be more than 7 characters long (at least 8 characters).'
-          : 'Nenosiri linapaswa kuwa na zaidi ya herufi 7 (angalau herufi 8).'
-      );
-      return;
-    }
-    if (!/[a-zA-Z]/.test(signupPassword)) {
-      setErrorMessage(
-        language === 'en'
-          ? 'Password must include alphabetic letters (a-z, A-Z).'
-          : 'Nenosiri lazima lijumuishe herufi za alfabeti (a-z, A-Z).'
-      );
-      return;
-    }
-    if (!/[0-9]/.test(signupPassword)) {
-      setErrorMessage(
-        language === 'en'
-          ? 'Password must include at least one number (0-9).'
-          : 'Nenosiri lazima lijumuishe angalau namba moja (0-9).'
-      );
-      return;
-    }
-    if (!/[^a-zA-Z0-9]/.test(signupPassword)) {
-      setErrorMessage(
-        language === 'en'
-          ? 'Password must include at least one special symbol (e.g. !@#$%^&*).'
-          : 'Nenosiri lazima lijumuishe angalau alama maalum moja (k.m. !@#$%^&*).'
-      );
-      return;
-    }
-    if (signupPassword !== signupConfirmPassword) {
-      setErrorMessage(language === 'en' ? 'Passwords do not match.' : 'Manenosiri hayafanani.');
-      return;
-    }
 
     const cleanUsername = signupUsername.trim()
       ? (signupUsername.trim().startsWith('@') ? signupUsername.trim() : `@${signupUsername.trim()}`)
       : `@${signupFirstName.trim().toLowerCase()}_${signupLastName.trim().toLowerCase()}`;
 
-    const registered = getRegisteredArtists();
-    const existingByEmail = registered.find((a: any) => a.email?.toLowerCase() === cleanEmail);
-
     const firstName = signupFirstName.trim();
     const lastName = signupLastName.trim();
     const username = cleanUsername;
-    const email = cleanEmail;
     const phone = signupPhone.trim();
     const bio = signupBio.trim();
     const specialization = signupSpecialization.trim();
     const categories = signupCategories.length > 0 ? signupCategories : ['Storybook Illustration'];
 
-    // Construct complete user profile object containing all required registration fields
-    const artistProfileData = {
-      name: `${firstName} ${lastName}`.trim() || fullName,
-      firstName: firstName,
-      lastName: lastName,
-      username: username,
-      email: email,
-      phone: phone,
-      bio: bio,
-      specialization: specialization,
-      categories: categories,
-      role: 'artist' as const,
-      status: 'unapplied' as any,
-      artistStatus: 'unapplied' as any,
-      adminVerified: false,
-      artistApplicationSubmitted: false,
-      avatar: signupAvatar || '🎨',
-      profilePicUrl: signupProfilePicUrl.trim(),
-      sampleImageUrl: '',
-      createdAt: serverTimestamp()
-    };
-
-    if (isSendingSignupLink) return;
-
-    // Already registered? Then they should log in instead of signing up again.
-    const alreadyRegisteredMsg = language === 'en'
-      ? 'This email address is already registered. Please log in instead.'
-      : 'Anwani hii ya barua pepe tayari imesajiliwa. Tafadhali ingia.';
-    if (existingByEmail && existingByEmail.isEmailVerified === true) {
-      setErrorMessage(alreadyRegisteredMsg);
-      return;
-    }
+    setIsSigningUp(true);
     try {
-      const { userDoc, artistDoc } = await getUserAndArtistDoc(cleanEmail);
-      if (userDoc || artistDoc) {
-        setErrorMessage(alreadyRegisteredMsg);
-        return;
-      }
-    } catch (lookupErr) {
-      // Not fatal: if the account really exists, finishing the sign-up detects it and refuses.
-      console.warn('Existing account lookup notice:', lookupErr);
-    }
-
-    // IMPORTANT: no Firebase account is created here. The details are parked in this browser (password
-    // as a hash only) and a link is emailed. The account is created only after that link is used.
-    setIsSendingSignupLink(true);
-    try {
-      const passwordHash = await hashPasswordAsync(signupPassword);
-      const parked = savePendingSignup({
+      await registerPendingArtistWithEmailLink({
         email: cleanEmail,
-        passwordHash,
-        profile: {
-          name: `${firstName} ${lastName}`.trim(),
-          firstName,
-          lastName,
-          username,
-          phone,
-          bio,
-          specialization,
-          categories,
-          avatar: signupAvatar || '🎨',
-          profilePicUrl: signupProfilePicUrl.trim()
-        },
-        createdAt: Date.now()
+        name: `${firstName} ${lastName}`.trim() || fullName,
+        firstName,
+        lastName,
+        username,
+        phone,
+        bio,
+        specialization,
+        categories,
+        avatar: signupAvatar || '🎨',
+        profilePicUrl: signupProfilePicUrl.trim()
       });
-      if (!parked) {
+    } catch (fbErr: any) {
+      console.warn("Firebase registration link info:", fbErr?.message || fbErr);
+      if (fbErr?.code === 'auth/email-already-in-use') {
         setErrorMessage(
           language === 'en'
-            ? 'Your browser could not store the registration details (storage may be full or blocked). Please free some space or allow site storage, then try again.'
-            : 'Kivinjari chako hakikuweza kuhifadhi taarifa za usajili (hifadhi inaweza kuwa imejaa au imezuiwa). Tafadhali jaribu tena.'
+            ? 'This email address is already registered and verified. Please log in instead.'
+            : 'Anwani hii ya barua pepe tayari imesajiliwa na kuthibitishwa. Tafadhali ingia.'
         );
-        return;
+      } else {
+        setErrorMessage(
+          fbErr?.message ||
+            (language === 'en'
+              ? 'Could not send verification link. Please check your email and try again.'
+              : 'Imeshindwa kutuma kiungo cha uthibitisho. Tafadhali jaribu tena.')
+        );
       }
-
-      const sendResult = await sendSignupVerificationLink(cleanEmail);
-      if (!sendResult.sent) {
-        clearPendingSignup();
-        setErrorMessage(describeVerificationSendError(sendResult.errorCode || null));
-        return;
-      }
+      setIsSigningUp(false);
+      return;
     } finally {
-      setIsSendingSignupLink(false);
+      setIsSigningUp(false);
     }
-
-    pendingPasswordRef.current = null;
-    setVerificationMode('pending_signup');
-    setVerificationSendError(null);
-    setResendCooldown(60);
 
     setSignupFirstName('');
     setSignupLastName('');
@@ -1174,149 +933,15 @@ export default function AuthModal({
     setSelectedCategories(['Storybook Illustration', 'Sculpture & Clay']);
     setSignupSpecialization('Storybook Illustration, Sculpture & Clay');
     setSignupBio('');
-    setSignupPassword('');
-    setSignupConfirmPassword('');
     setSignupProfilePicUrl('');
 
-    // Switch to dedicated Email Verification screen
-    setPendingVerificationEmail(cleanEmail);
-    setPendingVerificationName(fullName);
-    setAuthTab('email_verification');
     playChime('sparkle');
-  };
-
-  // The person opened the emailed link and typed their password: this is where the account is created.
-  const handleCompleteSignup = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (isCompletingSignup) return;
-    setErrorMessage(null);
-    setSuccessNotice(null);
-
-    const pending = getPendingSignup();
-    if (!pending) {
-      setCompleteSignupProblem('no_pending');
-      return;
-    }
-    if (!completePassword) {
-      setErrorMessage(language === 'en' ? 'Please enter your password.' : 'Tafadhali ingiza nenosiri lako.');
-      return;
-    }
-    const check = await verifyPasswordAsync(completePassword, pending.passwordHash);
-    if (!check.isValid) {
-      setErrorMessage(
-        language === 'en'
-          ? 'That is not the password you chose when you registered. Please type the same password.'
-          : 'Hilo si nenosiri ulilochagua ulipojisajili. Tafadhali andika nenosiri lile lile.'
-      );
-      return;
-    }
-
-    setIsCompletingSignup(true);
-    try {
-      const { email, uid } = await completeSignupFromEmailLink(completeSignupHref, completePassword);
-
-      // Local copy of the profile (same shape the app already uses), now that the account really exists.
-      try {
-        const savedList = getRegisteredArtists();
-        const updatedList = Array.isArray(savedList) ? savedList.filter((a: any) => a && a.email?.toLowerCase() !== email) : [];
-        updatedList.push({
-          uid,
-          role: 'artist' as const,
-          status: 'unapplied' as any,
-          artistStatus: 'unapplied' as any,
-          adminVerified: false,
-          artistApplicationSubmitted: false,
-          name: pending.profile.name,
-          firstName: pending.profile.firstName,
-          lastName: pending.profile.lastName,
-          email,
-          username: pending.profile.username,
-          password: pending.passwordHash,
-          phone: pending.profile.phone,
-          avatar: pending.profile.avatar,
-          profilePicUrl: pending.profile.profilePicUrl,
-          sampleImageUrl: '',
-          categories: pending.profile.categories,
-          specialization: pending.profile.specialization,
-          bio: pending.profile.bio || 'Creative Artist on PictureBook',
-          createdAt: new Date().toISOString(),
-          isLoggedIn: false,
-          isEmailVerified: true
-        });
-        safeSetItem('digipicture_registered_artists', updatedList);
-      } catch (cacheErr) {
-        console.error(cacheErr);
-      }
-
-      setCompletePassword('');
-      setCompleteSignupHref('');
-      setLoginIdentifier(email);
-      setLoginPassword('');
-      setSuccessNotice(
-        language === 'en'
-          ? 'Email verified and your account has been created! Please log in to continue.'
-          : 'Barua pepe imethibitishwa na akaunti yako imetengenezwa! Tafadhali ingia ili kuendelea.'
-      );
-      setAuthTab('login');
-      playChime('sparkle');
-    } catch (err: any) {
-      console.warn('Complete sign-up notice:', err?.code, err?.message || err);
-      if (err?.code === 'auth/invalid-action-code' || err?.code === 'auth/expired-action-code') {
-        setCompleteSignupProblem('expired');
-      } else if (err?.code === 'digipicture/no-pending-signup') {
-        setCompleteSignupProblem('no_pending');
-      } else if (err?.code === 'auth/email-already-in-use') {
-        setLoginIdentifier(pending.email);
-        setLoginPassword('');
-        setSuccessNotice(
-          language === 'en'
-            ? 'This email address already has an account. Please log in (or use "Forgot password" if you do not remember it).'
-            : 'Anwani hii ya barua pepe tayari ina akaunti. Tafadhali ingia (au tumia "Umesahau nenosiri" kama hukumbuki).'
-        );
-        setAuthTab('login');
-      } else if (err?.code === 'auth/network-request-failed') {
-        setErrorMessage(describeVerificationSendError('auth/network-request-failed'));
-      } else {
-        setErrorMessage(
-          language === 'en'
-            ? 'We could not finish creating your account. Please try again.'
-            : 'Hatukuweza kukamilisha kutengeneza akaunti yako. Tafadhali jaribu tena.'
-        );
-      }
-    } finally {
-      setIsCompletingSignup(false);
-    }
-  };
-
-  // Link expired / already used: email a new one (the parked registration is still valid).
-  const handleSendNewSignupLink = async () => {
-    const pending = getPendingSignup();
-    if (!pending) {
-      setCompleteSignupProblem('no_pending');
-      return;
-    }
-    setIsSendingSignupLink(true);
-    try {
-      const result = await sendSignupVerificationLink(pending.email);
-      if (!result.sent) {
-        setErrorMessage(describeVerificationSendError(result.errorCode || null));
-        return;
-      }
-      setCompleteSignupProblem(null);
-      setCompleteSignupHref('');
-      setCompletePassword('');
-      setVerificationMode('pending_signup');
-      setVerificationSendError(null);
-      setResendCooldown(60);
-      setPendingVerificationEmail(pending.email);
+    if (onRegistrationPendingVerification) {
+      onRegistrationPendingVerification(cleanEmail, fullName);
+    } else {
+      setPendingVerificationEmail(cleanEmail);
+      setPendingVerificationName(fullName);
       setAuthTab('email_verification');
-      setSuccessNotice(
-        language === 'en'
-          ? `A new verification link was sent to ${pending.email}.`
-          : `Kiungo kipya cha uthibitisho kimetumwa kwa ${pending.email}.`
-      );
-    } finally {
-      setIsSendingSignupLink(false);
     }
   };
 
@@ -1359,7 +984,7 @@ export default function AuthModal({
             </div>
           </div>
           <button
-            onClick={() => { pendingPasswordRef.current = null; onClose(); playChime('pop'); }}
+            onClick={() => { onClose(); playChime('pop'); }}
             className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-white/20 hover:bg-white/30 text-white flex items-center justify-center font-bold text-xs cursor-pointer transition shrink-0"
             title="Close"
             id="auth-modal-close-btn"
@@ -1531,7 +1156,7 @@ export default function AuthModal({
                   </button>
 
                   {/* Toggle Tab: Log In vs Sign Up (shown when not on email verification or forgot password) */}
-                  {authTab !== 'email_verification' && authTab !== 'forgot_password' && authTab !== 'complete_signup' && (
+                  {authTab !== 'email_verification' && authTab !== 'forgot_password' && (
                     <div className={`flex p-1 rounded-xl border select-none ${
                       isNight ? 'bg-slate-800 border-slate-700' : 'bg-orange-100/70 border-orange-200'
                     }`}>
@@ -1574,7 +1199,7 @@ export default function AuthModal({
                   {pendingVerificationEmail && errorMessage.includes('not verified') && (
                     <button
                       type="button"
-                      onClick={() => { setVerificationMode(getPendingSignup()?.email === pendingVerificationEmail.toLowerCase() ? 'pending_signup' : 'legacy_account'); setAuthTab('email_verification'); }}
+                      onClick={() => setAuthTab('email_verification')}
                       className="py-1 px-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold text-[11px] rounded-lg transition flex items-center gap-1 cursor-pointer"
                     >
                       <span>📩 View Email Verification Screen</span>
@@ -1593,7 +1218,7 @@ export default function AuthModal({
 
               {/* DEDICATED EMAIL VERIFICATION SCREEN */}
               {authTab === 'email_verification' && (
-                <div className="space-y-5 py-4 animate-fade-in text-center select-none" id="email-verification-screen">
+                <div className="space-y-6 py-4 animate-fade-in text-center select-none" id="email-verification-screen">
                   {/* Icon */}
                   <div className={`w-16 h-16 rounded-3xl mx-auto flex items-center justify-center text-3xl shadow-md border-2 ${
                     isNight ? 'bg-slate-800 border-amber-500/60 text-amber-300' : 'bg-orange-50 border-orange-200 text-orange-600'
@@ -1606,247 +1231,55 @@ export default function AuthModal({
                     <h3 className={`font-display font-black text-lg sm:text-xl ${
                       isNight ? 'text-amber-300' : 'text-gray-900'
                     }`}>
-                      {language === 'en' ? 'Verify Your Email' : 'Thibitisha Barua Pepe Yako'}
+                      {language === 'en' ? 'Email Verification' : 'Uthibitisho wa Barua Pepe'}
                     </h3>
                     <p className={`text-sm sm:text-base leading-relaxed font-medium px-2 ${
                       isNight ? 'text-slate-200' : 'text-gray-700'
                     }`}>
-                      {verificationSendError ? (
-                        language === 'en' ? (
-                          <>
-                            {verificationMode === 'pending_signup' ? 'We could not send the verification email to' : 'Your account exists, but we could not send the verification email to'}{' '}
-                            <span className={`font-bold font-mono px-1.5 py-0.5 rounded-md border break-all ${
-                              isNight ? 'text-amber-300 bg-slate-800 border-amber-500/40' : 'text-orange-600 bg-orange-100/70 border-orange-300'
-                            }`}>
-                              {pendingVerificationEmail || 'your email address'}
-                            </span>
-                            .
-                          </>
-                        ) : (
-                          <>
-                            {verificationMode === 'pending_signup' ? 'Hatukuweza kutuma barua pepe ya uthibitisho kwa' : 'Akaunti yako ipo, lakini hatukuweza kutuma barua pepe ya uthibitisho kwa'}{' '}
-                            <span className={`font-bold font-mono px-1.5 py-0.5 rounded-md border break-all ${
-                              isNight ? 'text-amber-300 bg-slate-800 border-amber-500/40' : 'text-orange-600 bg-orange-100/70 border-orange-300'
-                            }`}>
-                              {pendingVerificationEmail || 'barua pepe yako'}
-                            </span>
-                            .
-                          </>
-                        )
-                      ) : language === 'en' ? (
+                      {language === 'en' ? (
                         <>
-                          We have sent a verification link to{' '}
-                          <span className={`font-bold font-mono px-1.5 py-0.5 rounded-md border break-all ${
+                          We have sent you a verification email to{' '}
+                          <span className={`font-bold font-mono px-1.5 py-0.5 rounded-md border ${
                             isNight ? 'text-amber-300 bg-slate-800 border-amber-500/40' : 'text-orange-600 bg-orange-100/70 border-orange-300'
                           }`}>
                             {pendingVerificationEmail || 'your email address'}
                           </span>
-                          {verificationMode === 'pending_signup'
-                            ? '. Click the link in that email to verify it. Your account is created only after you click the link, and you can log in once that is done.'
-                            : '. Click the link in that email to verify your account. You can only log in after your email is verified.'}
+                          . Please click the link sent to your email to verify your account and log in.
                         </>
                       ) : (
                         <>
-                          Tumetuma kiungo cha uthibitisho kwa{' '}
-                          <span className={`font-bold font-mono px-1.5 py-0.5 rounded-md border break-all ${
+                          Tumekutumia barua pepe ya uthibitisho kwa{' '}
+                          <span className={`font-bold font-mono px-1.5 py-0.5 rounded-md border ${
                             isNight ? 'text-amber-300 bg-slate-800 border-amber-500/40' : 'text-orange-600 bg-orange-100/70 border-orange-300'
                           }`}>
                             {pendingVerificationEmail || 'barua pepe yako'}
                           </span>
-                          {verificationMode === 'pending_signup'
-                            ? '. Bofya kiungo kilicho kwenye barua pepe hiyo ili kuthibitisha. Akaunti yako itatengenezwa baada tu ya kubofya kiungo, kisha utaweza kuingia.'
-                            : '. Bofya kiungo kilicho kwenye barua pepe hiyo ili kuthibitisha akaunti yako. Unaweza kuingia tu baada ya barua pepe yako kuthibitishwa.'}
+                          . Tafadhali bofya kiungo kilichotumwa kwenye barua pepe yako ili kuthibitisha akaunti yako na kuingia.
                         </>
                       )}
                     </p>
                   </div>
 
-                  {/* Honest delivery status */}
-                  <div className="max-w-sm mx-auto pt-1 space-y-2.5">
-                    {verificationSendError ? (
-                      <div className="p-3.5 rounded-2xl border border-rose-300 bg-rose-50 text-rose-800 text-xs font-semibold text-left flex items-start gap-2">
-                        <span>⚠️</span>
-                        <span>{describeVerificationSendError(verificationSendError)}</span>
-                      </div>
-                    ) : (
-                      <div className={`p-4 rounded-2xl border flex items-center justify-center gap-2.5 text-xs font-semibold ${
-                        isNight ? 'bg-amber-955/40 border-amber-500/40 text-amber-200' : 'bg-orange-50 border-orange-200 text-orange-950'
-                      }`}>
-                        <Clock className="w-4 h-4 text-amber-500 shrink-0" />
-                        <span>
-                          {language === 'en'
-                            ? 'Waiting for you to verify your email...'
-                            : 'Inasubiri uthibitishe barua pepe yako...'}
-                        </span>
-                      </div>
-                    )}
+                  {/* Status notice instructing user to click link in their email */}
+                  <div className="max-w-sm mx-auto pt-2 space-y-2.5">
+                    <div className={`p-4 rounded-2xl border flex items-center justify-center gap-2.5 text-xs font-semibold ${
+                      isNight ? 'bg-amber-955/40 border-amber-500/40 text-amber-200' : 'bg-orange-50 border-orange-200 text-orange-950'
+                    }`}>
+                      <Clock className="w-4 h-4 text-amber-500 animate-pulse shrink-0" />
+                      <span>
+                        {language === 'en'
+                          ? 'Waiting for verification link to be clicked...'
+                          : 'Inasubiri kiungo cha uthibitisho kubofya...'}
+                      </span>
+                    </div>
                     <p className="text-[11px] text-stone-500 dark:text-stone-400">
                       {language === 'en'
-                        ? 'Did not receive it? Check your Spam / Junk and Promotions folders. The email comes from a "noreply" address and can take a few minutes.'
-                        : 'Hujaipata? Kagua folda yako ya Spam / Junk na Promotions. Barua pepe inatoka kwa anwani ya "noreply" na inaweza kuchukua dakika chache.'}
+                        ? 'Did not receive the email? Please check your spam or junk folder.'
+                        : 'Hujaona barua pepe? Tafadhali kagua folda yako ya barua taka (spam).'}
                     </p>
-                  </div>
-
-                  {/* Actions */}
-                  <div className="max-w-xs mx-auto space-y-2.5">
-                    <button
-                      type="button"
-                      onClick={handleResendVerification}
-                      disabled={isResendingVerification || resendCooldown > 0}
-                      className={`w-full py-2.5 px-4 rounded-xl font-display font-bold text-xs sm:text-sm border-2 transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
-                        isNight
-                          ? 'bg-slate-800 hover:bg-slate-700 text-amber-200 border-amber-500/50'
-                          : 'bg-white hover:bg-orange-50 text-orange-700 border-orange-300'
-                      }`}
-                      id="resend-verification-email-btn"
-                    >
-                      <Mail className="w-4 h-4" />
-                      <span>
-                        {isResendingVerification
-                          ? (language === 'en' ? 'Sending...' : 'Inatuma...')
-                          : resendCooldown > 0
-                            ? (language === 'en' ? `Resend available in ${resendCooldown}s` : `Tuma tena baada ya sekunde ${resendCooldown}`)
-                            : (language === 'en' ? 'Resend verification email' : 'Tuma tena barua pepe ya uthibitisho')}
-                      </span>
-                    </button>
-
-                    {verificationMode === 'pending_signup' ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          clearPendingSignup();
-                          pendingPasswordRef.current = null;
-                          setErrorMessage(null);
-                          setSuccessNotice(null);
-                          setAuthTab('signup');
-                          playChime('pop');
-                        }}
-                        className="w-full text-[11px] font-semibold underline underline-offset-2 text-stone-500 hover:text-orange-600 dark:text-stone-400 cursor-pointer"
-                        id="verification-wrong-email-btn"
-                      >
-                        {language === 'en' ? 'Wrong email address? Go back and sign up again' : 'Barua pepe si sahihi? Rudi ujisajili tena'}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          pendingPasswordRef.current = null;
-                          setErrorMessage(null);
-                          setSuccessNotice(null);
-                          setAuthTab('login');
-                        }}
-                        className="w-full text-[11px] font-semibold underline underline-offset-2 text-stone-500 hover:text-orange-600 dark:text-stone-400 cursor-pointer"
-                        id="verification-back-btn"
-                      >
-                        {language === 'en' ? '← Back' : '← Rudi nyuma'}
-                      </button>
-                    )}
                   </div>
                 </div>
               )}
-
-              {/* FINISH SIGN-UP SCREEN (shown after the emailed link is opened; the account is created here) */}
-              {authTab === 'complete_signup' && (() => {
-                const pendingForCompletion = getPendingSignup();
-                const problem = !pendingForCompletion ? 'no_pending' : completeSignupProblem;
-                return (
-                  <div className="space-y-5 py-4 animate-fade-in text-center" id="complete-signup-screen">
-                    <div className={`w-16 h-16 rounded-3xl mx-auto flex items-center justify-center text-3xl shadow-md border-2 ${
-                      isNight ? 'bg-slate-800 border-emerald-500/60 text-emerald-300' : 'bg-emerald-50 border-emerald-200 text-emerald-600'
-                    }`}>
-                      {problem ? '⚠️' : '✅'}
-                    </div>
-
-                    {problem === 'no_pending' && (
-                      <div className="space-y-3 max-w-sm mx-auto">
-                        <h3 className={`font-display font-black text-lg ${isNight ? 'text-amber-300' : 'text-gray-900'}`}>
-                          {language === 'en' ? 'We could not find your registration' : 'Hatukupata usajili wako'}
-                        </h3>
-                        <p className={`text-sm leading-relaxed font-medium ${isNight ? 'text-slate-200' : 'text-gray-700'}`}>
-                          {language === 'en'
-                            ? 'Your registration details are saved in the browser you signed up with. Please open the email link in that same browser (and on the same device), or sign up again.'
-                            : 'Taarifa zako za usajili zimehifadhiwa kwenye kivinjari ulichotumia kujisajili. Tafadhali fungua kiungo cha barua pepe kwenye kivinjari kile kile (na kifaa kile kile), au jisajili tena.'}
-                        </p>
-                        <button
-                          type="button"
-                          onClick={() => { setCompleteSignupProblem(null); setCompleteSignupHref(''); setAuthTab('signup'); setErrorMessage(null); }}
-                          className="w-full py-3 px-4 bg-gradient-to-r from-orange-500 to-amber-500 text-white font-display font-extrabold text-xs sm:text-sm rounded-xl shadow-md border-b-4 border-orange-700 cursor-pointer"
-                        >
-                          {language === 'en' ? 'Sign up again' : 'Jisajili tena'}
-                        </button>
-                      </div>
-                    )}
-
-                    {problem === 'expired' && (
-                      <div className="space-y-3 max-w-sm mx-auto">
-                        <h3 className={`font-display font-black text-lg ${isNight ? 'text-amber-300' : 'text-gray-900'}`}>
-                          {language === 'en' ? 'This link has expired or was already used' : 'Kiungo hiki kimeisha muda au kimeshatumika'}
-                        </h3>
-                        <p className={`text-sm leading-relaxed font-medium ${isNight ? 'text-slate-200' : 'text-gray-700'}`}>
-                          {language === 'en'
-                            ? 'No problem: we can email you a new one. Your registration details are still saved.'
-                            : 'Hakuna shida: tunaweza kukutumia kingine. Taarifa zako za usajili bado zimehifadhiwa.'}
-                        </p>
-                        <button
-                          type="button"
-                          onClick={handleSendNewSignupLink}
-                          disabled={isSendingSignupLink}
-                          className="w-full py-3 px-4 bg-gradient-to-r from-orange-500 to-amber-500 text-white font-display font-extrabold text-xs sm:text-sm rounded-xl shadow-md border-b-4 border-orange-700 cursor-pointer disabled:opacity-60"
-                        >
-                          {isSendingSignupLink
-                            ? (language === 'en' ? 'Sending...' : 'Inatuma...')
-                            : (language === 'en' ? 'Email me a new link' : 'Nitumie kiungo kipya')}
-                        </button>
-                      </div>
-                    )}
-
-                    {!problem && pendingForCompletion && (
-                      <form onSubmit={handleCompleteSignup} className="space-y-4 max-w-sm mx-auto text-left">
-                        <div className="text-center space-y-2">
-                          <h3 className={`font-display font-black text-lg ${isNight ? 'text-amber-300' : 'text-gray-900'}`}>
-                            {language === 'en' ? 'Email link confirmed' : 'Kiungo cha barua pepe kimethibitishwa'}
-                          </h3>
-                          <p className={`text-sm leading-relaxed font-medium ${isNight ? 'text-slate-200' : 'text-gray-700'}`}>
-                            {language === 'en'
-                              ? <>One last step: enter the password you chose when you registered for <span className="font-bold font-mono break-all">{pendingForCompletion.email}</span> to create your account.</>
-                              : <>Hatua ya mwisho: ingiza nenosiri ulilochagua ulipojisajili kwa <span className="font-bold font-mono break-all">{pendingForCompletion.email}</span> ili kutengeneza akaunti yako.</>}
-                          </p>
-                        </div>
-
-                        <div className="relative">
-                          <Lock className="w-4 h-4 text-orange-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                          <input
-                            type="password"
-                            value={completePassword}
-                            onChange={(e) => setCompletePassword(e.target.value)}
-                            autoComplete="current-password"
-                            autoFocus
-                            placeholder={language === 'en' ? 'Your password' : 'Nenosiri lako'}
-                            className={`w-full pl-9 pr-3 py-3 rounded-xl border-2 text-sm font-medium outline-none focus:ring-2 focus:ring-orange-400 ${
-                              isNight ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-orange-200 text-gray-900'
-                            }`}
-                            id="complete-signup-password"
-                          />
-                        </div>
-
-                        <button
-                          type="submit"
-                          disabled={isCompletingSignup}
-                          className="w-full py-3 px-4 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white font-display font-extrabold text-xs sm:text-sm rounded-xl shadow-md border-b-4 border-orange-700 active:translate-y-0.5 cursor-pointer transition flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
-                          id="complete-signup-submit-btn"
-                        >
-                          <ShieldCheck className="w-4 h-4" />
-                          <span>
-                            {isCompletingSignup
-                              ? (language === 'en' ? 'Creating your account...' : 'Inatengeneza akaunti yako...')
-                              : (language === 'en' ? 'Create my account' : 'Tengeneza akaunti yangu')}
-                          </span>
-                        </button>
-                      </form>
-                    )}
-                  </div>
-                );
-              })()}
 
               {/* 1. ARTIST LOG IN FORM */}
               {authTab === 'login' && (
@@ -2488,75 +1921,33 @@ export default function AuthModal({
                     />
                   </div>
 
-                  {/* Password & Confirm */}
-                  <div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div>
-                        <label className={`block text-xs font-display font-bold mb-1 ${
-                          isNight ? 'text-amber-200' : 'text-amber-955'
-                        }`}>
-                          {language === 'en' ? 'Password *' : 'Nenosiri *'}
-                        </label>
-                        <input
-                          type="password"
-                          required
-                          value={signupPassword}
-                          onChange={(e) => setSignupPassword(e.target.value)}
-                          placeholder="••••••••"
-                          className={`w-full px-3 py-2 text-xs rounded-xl border-2 focus:outline-none font-medium ${
-                            isNight
-                              ? 'bg-slate-800 text-slate-100 border-slate-700 focus:border-amber-500'
-                              : 'bg-orange-50/20 text-gray-900 border-orange-200 focus:border-orange-500'
-                          }`}
-                          id="artist-signup-password-input"
-                        />
-                      </div>
-                      <div>
-                        <label className={`block text-xs font-display font-bold mb-1 ${
-                          isNight ? 'text-amber-200' : 'text-amber-955'
-                        }`}>
-                          {language === 'en' ? 'Confirm Password *' : 'Thibitisha Nenosiri *'}
-                        </label>
-                        <input
-                          type="password"
-                          required
-                          value={signupConfirmPassword}
-                          onChange={(e) => setSignupConfirmPassword(e.target.value)}
-                          placeholder="••••••••"
-                          className={`w-full px-3 py-2 text-xs rounded-xl border-2 focus:outline-none font-medium ${
-                            isNight
-                              ? 'bg-slate-800 text-slate-100 border-slate-700 focus:border-amber-500'
-                              : 'bg-orange-50/20 text-gray-900 border-orange-200 focus:border-orange-500'
-                          }`}
-                          id="artist-signup-confirm-password-input"
-                        />
-                      </div>
-                    </div>
-                    <p className={`text-[10px] font-medium mt-2 flex items-center gap-1.5 p-2 rounded-xl border ${
-                      isNight
-                        ? 'bg-slate-800/80 border-slate-700 text-slate-300'
-                        : 'bg-amber-100/70 border-amber-200 text-amber-900/90'
-                    }`}>
-                      <span>🔐</span>
-                      <span>
-                        {language === 'en'
-                          ? 'Password must be more than 7 characters long and include alphabets, numbers, and special symbols (!@#$%^&*).'
-                          : 'Nenosiri lazima liwe na zaidi ya herufi 7 na lijumuishe herufi, namba, na alama maalum (!@#$%^&*).'}
-                      </span>
-                    </p>
+                  {/* Deferred Password Setup Notice */}
+                  <div className={`text-xs font-medium flex items-start gap-2.5 p-3 rounded-2xl border ${
+                    isNight
+                      ? 'bg-slate-800/80 border-amber-500/40 text-amber-200'
+                      : 'bg-amber-50/90 border-amber-200 text-amber-950'
+                  }`}>
+                    <ShieldCheck className="w-4 h-4 text-orange-500 shrink-0 mt-0.5" />
+                    <span>
+                      {language === 'en'
+                        ? 'Next step: We will email you a verification link. Click that link to verify your email address and create your account password before logging in.'
+                        : 'Hatua inayofuata: Tutakutumia kiungo cha uthibitisho kwenye barua pepe yako. Bofya kiungo hicho ili kuthibitisha barua pepe na kuunda nenosiri lako kabla ya kuingia.'}
+                    </span>
                   </div>
 
                   {/* Submit Signup Button */}
                   <button
                     type="submit"
-                    disabled={isSendingSignupLink}
-                    className="w-full py-3 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white font-display font-bold text-xs sm:text-sm rounded-xl shadow-md border-b-3 border-amber-700 active:translate-y-0.5 cursor-pointer transition flex items-center justify-center gap-2 mt-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                    disabled={isSigningUp}
+                    className="w-full py-3 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 disabled:opacity-60 text-white font-display font-bold text-xs sm:text-sm rounded-xl shadow-md border-b-3 border-amber-700 active:translate-y-0.5 cursor-pointer transition flex items-center justify-center gap-2 mt-2"
                     id="artist-signup-submit-btn"
                   >
-                    <Sparkles className="w-4 h-4" />
-                    <span>{isSendingSignupLink
-                      ? (language === 'en' ? 'Sending verification link...' : 'Inatuma kiungo cha uthibitisho...')
-                      : (language === 'en' ? 'Register & Send Verification Link' : 'Jisajili & Tuma Kiungo cha Uthibitisho')}</span>
+                    <Mail className="w-4 h-4" />
+                    <span>
+                      {isSigningUp
+                        ? (language === 'en' ? 'Sending Verification Link...' : 'Inatuma Kiungo...')
+                        : (language === 'en' ? 'Register & Send Verification Link' : 'Jisajili & Tuma Kiungo cha Uthibitisho')}
+                    </span>
                   </button>
 
                   <p className={`text-[11px] text-center mt-2 ${

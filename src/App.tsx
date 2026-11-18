@@ -47,6 +47,7 @@ import EducationTips from './components/EducationTips';
 import ArtistWorkbench from './components/ArtistWorkbench';
 import AdminDashboard from './components/AdminDashboard';
 import AuthModal, { UserAccount } from './components/AuthModal';
+import VerifyAccountPage from './components/VerifyAccountPage';
 import { LegalComplianceModal } from './components/LegalComplianceModal';
 import { MaintenanceScreen } from './components/MaintenanceScreen';
 import { SendMessageModal } from './components/SendMessageModal';
@@ -66,12 +67,13 @@ import {
   subscribeToBooks,
   verifyAndActivateArtistInFirestore,
   handleIncomingEmailVerification,
-  isSignupEmailLink,
-  isSignupCompletionInProgress,
   signOutFromFirebaseAndClearSession,
   purgeAllApplicationDataFromCloudAndLocal,
   auth,
   onAuthStateChanged,
+  signOut,
+  isSignInWithEmailLink,
+  getVerificationFlowActive,
   getUserAndArtistDoc,
   fetchProfileFromFirestore,
   syncProfileToFirestore
@@ -109,6 +111,26 @@ const getPageIllustration = (page: BookPage, book: PictureBook): string => {
 
   // Custom books fallback to coverImage if available, else empty string
   return book.isCustom && book.coverImage ? book.coverImage : '';
+};
+
+const detectInitialVerifyState = (): { mode: 'none' | 'verify'; email: string; actionUrl: string } => {
+  if (typeof window === 'undefined') return { mode: 'none', email: '', actionUrl: '' };
+  const path = window.location.pathname;
+  const params = new URLSearchParams(window.location.search);
+  const oobCode = params.get('oobCode');
+  const linkMode = params.get('mode');
+  const verifyEmail = params.get('verify_email') || params.get('email') || '';
+  const fullUrl = window.location.href;
+  const isVerifyPath = path === '/verify' || path.endsWith('/verify');
+  let isEmailLink = false;
+  try {
+    isEmailLink = isSignInWithEmailLink(auth, fullUrl);
+  } catch (_) {}
+  const isActionOob = Boolean(oobCode && (linkMode === 'signIn' || linkMode === 'verifyEmail'));
+  if (isVerifyPath || isEmailLink || isActionOob || Boolean(params.get('verify_email'))) {
+    return { mode: 'verify', email: verifyEmail.trim().toLowerCase(), actionUrl: fullUrl };
+  }
+  return { mode: 'none', email: '', actionUrl: '' };
 };
 
 export default function App() {
@@ -174,10 +196,18 @@ export default function App() {
   // Unified theme synchronization hook
   const { theme, isNight, setTheme, toggleTheme, syncTheme } = useThemeSync(userAccount, appMode);
 
+  const [initialVerifyState] = useState(() => detectInitialVerifyState());
+  const [authPageMode, setAuthPageMode] = useState<'none' | 'check_email' | 'verify'>(initialVerifyState.mode);
+  const [verificationEmail, setVerificationEmail] = useState<string>(initialVerifyState.email);
+  const [verificationActionUrl, setVerificationActionUrl] = useState<string>(initialVerifyState.actionUrl);
+  const authPageModeRef = React.useRef<'none' | 'check_email' | 'verify'>(authPageMode);
+  useEffect(() => {
+    authPageModeRef.current = authPageMode;
+  }, [authPageMode]);
+
   const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
   const [authModalInitialStep, setAuthModalInitialStep] = useState<'role_select' | 'artist_auth' | 'student_setup'>('role_select');
-  const [authModalInitialTab, setAuthModalInitialTab] = useState<'login' | 'signup' | 'forgot_password' | 'email_verification' | 'complete_signup'>('login');
-  const [authModalCompleteSignupLink, setAuthModalCompleteSignupLink] = useState<string>('');
+  const [authModalInitialTab, setAuthModalInitialTab] = useState<'login' | 'signup' | 'forgot_password' | 'email_verification'>('login');
   const [authModalInitialEmail, setAuthModalInitialEmail] = useState<string>('');
   const [authModalSuccessNotice, setAuthModalSuccessNotice] = useState<string>('');
   const [showLegalModal, setShowLegalModal] = useState<boolean>(false);
@@ -286,33 +316,27 @@ export default function App() {
     validateActiveSession();
   }, []);
 
-  // Fast onAuthStateChanged authentication routing with optimistic UI mounting
+  // Fast onAuthStateChanged authentication routing (strictly ignores unverified sessions & verification setup)
   useEffect(() => {
     if (!auth) return;
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      if (currentUser && currentUser.email) {
-        // Email verification gate: Firebase signs a user in automatically the moment the account is
-        // created (and again on every login attempt). An email/password account must NOT be treated
-        // as logged in until its email address has been verified. (Google accounts are always verified.)
-        // Also ignore the short-lived session used while a sign-up is being finished from the emailed link.
-        if (isSignupCompletionInProgress()) {
-          return;
-        }
-        const usesPasswordProvider = currentUser.providerData.some((p) => p.providerId === 'password');
-        if (usesPasswordProvider && !currentUser.emailVerified) {
-          return;
-        }
+      if (getVerificationFlowActive() || authPageModeRef.current !== 'none') {
+        return;
+      }
 
+      if (currentUser && !currentUser.emailVerified) {
+        // Prevent auto-login on unverified Firebase Auth sessions
+        try {
+          await signOut(auth);
+        } catch (_) {}
+        return;
+      }
+
+      if (currentUser && currentUser.email && currentUser.emailVerified) {
         try {
           // Parallel Firestore lookup to quickly synchronize profile permissions
           const { userDoc, artistDoc } = await getUserAndArtistDoc(currentUser.email, currentUser.uid);
-
-          // The person may have signed out (or been signed out) while the lookup was running.
-          if (auth.currentUser?.uid !== currentUser.uid) {
-            return;
-          }
-
           const found = artistDoc || userDoc;
           if (found) {
             const isApproved = found.status === 'approved' || found.artistStatus === 'approved' || found.adminVerified === true || found.role === 'admin';
@@ -405,98 +429,20 @@ export default function App() {
     }
   }, [appMode, userAccount, language]);
 
-  // Handle incoming email verification links from URL query params
+  // Route /verify and incoming email action links to the dedicated VerifyAccountPage
   useEffect(() => {
-    const processEmailVerification = async () => {
-      try {
-        const urlParams = new URLSearchParams(window.location.search);
-        let searchParams = urlParams;
-        if (!urlParams.get('verify_email') && !urlParams.get('email') && !urlParams.get('oobCode') && window.location.hash.includes('?')) {
-          searchParams = new URLSearchParams(window.location.hash.substring(window.location.hash.indexOf('?')));
-        }
-
-        // Sign-up link from the email (account is only created in the next step, in the modal).
-        // Capture the full URL first: it is needed to complete the sign-in and then cleared.
-        const fullHref = window.location.href;
-        if (isSignupEmailLink(fullHref)) {
-          window.history.replaceState({}, document.title, window.location.pathname);
-          setAuthModalInitialStep('artist_auth');
-          setAuthModalInitialTab('complete_signup');
-          setAuthModalCompleteSignupLink(fullHref);
-          setAuthModalSuccessNotice('');
-          setShowAuthModal(true);
-          return;
-        }
-
-        // Nothing to do unless the URL actually carries a verification link / hint.
-        if (!['oobCode', 'verify_email', 'email'].some((k) => searchParams.get(k))) {
-          return;
-        }
-
-        // Clear the URL right away: an action code is single-use, so a second run of this effect
-        // (React StrictMode, language change) must not try to apply it again.
-        window.history.replaceState({}, document.title, window.location.pathname);
-
-        const verification = await handleIncomingEmailVerification(searchParams);
-
-        if (verification) {
-          const cleanEmail = verification.email.trim().toLowerCase();
-
-          if (verification.verified) {
-            // Firebase confirmed the link: mirror it into the local caches.
-            // 1. Check pending registrations first
-            let pendingList = safeGetJSON<any[]>('digipicture_pending_registrations', []);
-            const pendingAccount = Array.isArray(pendingList) ? pendingList.find((a: any) => a && a.email?.toLowerCase() === cleanEmail) : null;
-
-            let registered = safeGetJSON<any[]>('digipicture_registered_artists', []);
-            if (!Array.isArray(registered)) registered = [];
-            const foundIndex = registered.findIndex((a: any) => a && a.email?.toLowerCase() === cleanEmail);
-
-            if (pendingAccount) {
-              const verifiedAccount = { ...pendingAccount, isEmailVerified: true };
-              if (foundIndex !== -1) {
-                registered[foundIndex] = verifiedAccount;
-              } else {
-                registered.push(verifiedAccount);
-              }
-              safeSetItem('digipicture_registered_artists', registered);
-
-              // Clean up pending list
-              const updatedPending = pendingList.filter((a: any) => a && a.email?.toLowerCase() !== cleanEmail);
-              safeSetItem('digipicture_pending_registrations', updatedPending);
-            } else if (foundIndex !== -1) {
-              registered[foundIndex].isEmailVerified = true;
-              safeSetItem('digipicture_registered_artists', registered);
-            }
-          }
-
-          // Always land on the login screen (never straight into the account): the person must
-          // still enter their password. The message depends on what Firebase actually confirmed.
-          setAuthModalInitialStep('artist_auth');
-          setAuthModalInitialTab('login');
-          setAuthModalInitialEmail(cleanEmail);
-          setAuthModalSuccessNotice(
-            verification.verified
-              ? (language === 'en'
-                  ? `Email verified successfully for ${cleanEmail}! Please enter your password to log in.`
-                  : `Barua pepe ${cleanEmail} imethibitishwa kwa mafanikio! Ingiza nenosiri lako ili kuingia.`)
-              : verification.errorCode
-                ? (language === 'en'
-                    ? `This verification link has expired or was already used. If you already verified ${cleanEmail}, log in below. If not, log in and we will send you a fresh link.`
-                    : `Kiungo hiki cha uthibitisho kimeisha muda au kimeshatumika. Kama ulishathibitisha ${cleanEmail}, ingia hapa chini. Kama bado, ingia nasi tutakutumia kiungo kipya.`)
-                : (language === 'en'
-                    ? `Log in with ${cleanEmail} to continue. Your email must be verified before you can access your account.`
-                    : `Ingia kwa ${cleanEmail} kuendelea. Barua pepe yako lazima ithibitishwe kabla ya kufikia akaunti yako.`)
-          );
-          setShowAuthModal(true);
-          if (verification.verified) playChime('sparkle');
-        }
-      } catch (e) {
-        console.error("Failed to process email verification URL:", e);
+    const syncVerifyRoute = () => {
+      const detected = detectInitialVerifyState();
+      if (detected.mode === 'verify') {
+        setVerificationEmail(detected.email);
+        setVerificationActionUrl(detected.actionUrl);
+        setAuthPageMode('verify');
+        setShowAuthModal(false);
       }
     };
-    processEmailVerification();
-  }, [language]);
+    window.addEventListener('popstate', syncVerifyRoute);
+    return () => window.removeEventListener('popstate', syncVerifyRoute);
+  }, []);
 
   // Support secret admin route access (/secret-admin-gate, #secret-admin-gate, ?route=secret-admin-gate)
   useEffect(() => {
@@ -1795,6 +1741,54 @@ export default function App() {
     );
   }
 
+  // Render dedicated "Check Your Email" or "/verify" password-setup page cleanly,
+  // completely hiding the main app dashboard/workspace and preventing any auto-login.
+  if (authPageMode !== 'none') {
+    return (
+      <VerifyAccountPage
+        mode={authPageMode}
+        initialEmail={verificationEmail}
+        initialActionUrl={verificationActionUrl}
+        language={language}
+        theme={theme}
+        onGoToLogin={(emailToPrefill) => {
+          if (window.location.pathname !== '/' || window.location.search) {
+            window.history.replaceState({}, document.title, '/');
+          }
+          setAuthPageMode('none');
+          setAppMode('shelf');
+          setShowSettings(false);
+          setUserAccount({
+            role: 'student',
+            name: 'Guest Explorer',
+            email: '',
+            username: '@guest',
+            avatar: '🐣',
+            isLoggedIn: false
+          });
+          setAuthModalInitialStep('artist_auth');
+          setAuthModalInitialTab('login');
+          setAuthModalInitialEmail((emailToPrefill || verificationEmail || '').trim().toLowerCase());
+          setAuthModalSuccessNotice(
+            authPageMode === 'verify'
+              ? (language === 'en'
+                  ? 'Account verified! Please enter your email and password to log in.'
+                  : 'Akaunti imethibitishwa! Tafadhali ingiza barua pepe na nenosiri lako kuingia.')
+              : ''
+          );
+          setShowAuthModal(true);
+        }}
+        onBackHome={() => {
+          if (window.location.pathname !== '/' || window.location.search) {
+            window.history.replaceState({}, document.title, '/');
+          }
+          setAuthPageMode('none');
+          setAppMode('shelf');
+        }}
+      />
+    );
+  }
+
   return (
     <div className={`min-h-screen w-full max-w-full overflow-x-hidden box-border transition-colors duration-300 selection:bg-orange-200 ${
       theme === 'night' ? 'bg-slate-950 text-slate-100' : 'bg-brand-cream text-gray-900'
@@ -1978,7 +1972,6 @@ export default function App() {
               setShowAuthModal(false);
               setAuthModalInitialEmail('');
               setAuthModalSuccessNotice('');
-              setAuthModalCompleteSignupLink('');
             }}
             onAuthenticate={(account) => {
               setUserAccount(account);
@@ -2002,7 +1995,22 @@ export default function App() {
             initialAuthTab={authModalInitialTab}
             initialLoginEmail={authModalInitialEmail}
             initialSuccessNotice={authModalSuccessNotice}
-            initialCompleteSignupLink={authModalCompleteSignupLink}
+            onRegistrationPendingVerification={(pendingEmail) => {
+              setShowAuthModal(false);
+              setShowSettings(false);
+              setAppMode('shelf');
+              setUserAccount({
+                role: 'student',
+                name: 'Guest Explorer',
+                email: '',
+                username: '@guest',
+                avatar: '🐣',
+                isLoggedIn: false
+              });
+              setVerificationEmail(pendingEmail);
+              setVerificationActionUrl('');
+              setAuthPageMode('check_email');
+            }}
           />
 
           {/* ==================== SETTINGS & USER PROFILE OVERLAY PANEL ==================== */}

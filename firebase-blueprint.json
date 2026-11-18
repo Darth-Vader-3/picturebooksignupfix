@@ -54,16 +54,24 @@
     },
     "pending_registrations": {
       "title": "Pending Registrations",
-      "description": "Artist accounts pending email verification",
+      "description": "Artist profiles awaiting email link verification before Firebase Auth account and password setup",
       "type": "object",
       "properties": {
         "email": { "type": "string", "format": "email", "maxLength": 254 },
         "name": { "type": "string", "maxLength": 100 },
+        "firstName": { "type": "string", "maxLength": 50 },
+        "lastName": { "type": "string", "maxLength": 50 },
         "username": { "type": "string", "maxLength": 50 },
-        "hashedPassword": { "type": "string", "maxLength": 256 },
-        "bio": { "type": "string", "maxLength": 1000 },
-        "role": { "type": "string", "maxLength": 30 },
-        "createdAt": { "type": "string", "maxLength": 50 }
+        "phone": { "type": "string", "maxLength": 30 },
+        "bio": { "type": "string", "maxLength": 2000 },
+        "specialization": { "type": "string", "maxLength": 100 },
+        "categories": { "type": "array" },
+        "avatar": { "type": "string", "maxLength": 100 },
+        "profilePicUrl": { "type": "string", "maxLength": 500000 },
+        "role": { "type": "string", "enum": ["artist"] },
+        "status": { "type": "string", "enum": ["unapplied"] },
+        "createdAt": { "type": "string", "maxLength": 50 },
+        "updatedAt": { "type": "string", "maxLength": 50 }
       },
       "required": ["email", "name"]
     },

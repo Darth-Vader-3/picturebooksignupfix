@@ -58,7 +58,15 @@ service cloud.firestore {
     }
 
     match /pending_registrations/{email} {
-      allow read, write: if isAuthEmail(email) || isAdmin();
+      allow read, delete: if isAuthEmail(email) || isAdmin();
+      allow create, update: if email is string
+        && email.size() <= 254
+        && request.resource.data.email is string
+        && request.resource.data.email.lower() == email.lower()
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 100
+        && !('password' in request.resource.data);
     }
 
     match /artist_applications/{docId} {

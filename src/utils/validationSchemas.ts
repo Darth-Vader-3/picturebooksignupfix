@@ -29,14 +29,14 @@ const safeTextSchema = (minLength: number, maxLength: number) =>
     .min(minLength, `Must be at least ${minLength} characters`)
     .max(maxLength, `Must not exceed ${maxLength} characters`);
 
-// 1. User Registration Schema
+// 1. User Registration Schema (password is created on /verify after email link verification)
 export const UserRegistrationSchema = z.object({
   firstName: safeTextSchema(1, 50).optional().or(z.literal('')),
   lastName: safeTextSchema(1, 50).optional().or(z.literal('')),
   name: safeTextSchema(2, 100),
   email: emailSchema,
   username: usernameSchema.optional().or(z.literal('')),
-  password: z.string().min(8, 'Password must be at least 8 characters').max(128, 'Password too long'),
+  password: z.string().min(8, 'Password must be at least 8 characters').max(128, 'Password too long').optional().or(z.literal('')),
   phone: z.string().max(30).optional().or(z.literal('')),
   avatar: z.string().max(20).optional().or(z.literal('')),
   profilePicUrl: z.string().max(500000).optional().or(z.literal('')),
@@ -45,6 +45,14 @@ export const UserRegistrationSchema = z.object({
   categories: z.array(z.string().max(50)).max(10).default(['Storybook Illustration']),
   role: z.enum(['student', 'artist', 'admin']).default('artist')
 });
+
+export const PasswordSetupSchema = z
+  .string()
+  .min(8, 'Password must be more than 7 characters long (at least 8 characters).')
+  .max(128, 'Password must not exceed 128 characters.')
+  .regex(/[a-zA-Z]/, 'Password must include alphabetic letters (a-z, A-Z).')
+  .regex(/[0-9]/, 'Password must include at least one number (0-9).')
+  .regex(/[^a-zA-Z0-9]/, 'Password must include at least one special symbol (e.g. !@#$%^&*).');
 
 export type UserRegistrationInput = z.infer<typeof UserRegistrationSchema>;
 
